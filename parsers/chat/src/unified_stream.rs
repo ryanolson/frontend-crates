@@ -3084,7 +3084,9 @@ where
         // Ranges beside each probe's held text, while recording.
         let mut undecided_spans: HashMap<u32, Spans> = HashMap::new();
         // Whether the input chunks carry a source slot, so the adapter records.
+        // The first data chunk decides; every later one must agree.
         let mut recording = false;
+        let mut slot_presence: Option<bool> = None;
         let mut states: HashMap<u32, ChoiceState> = HashMap::new();
         // Per-choice bookkeeping that must outlive a single `ChoiceState`: a
         // `ChoiceState` is dropped whenever an already-parsed chunk interrupts a
@@ -3117,18 +3119,13 @@ where
 
             // The input slot dates the input text. Take it out, so no chunk built
             // from this one repeats it.
-            let has_slot = match chat.sources_mut() {
-                Some(slot) => {
-                    let sources = std::mem::take(slot);
-                    recording = true;
-                    Some(sources)
-                }
-                None => None,
-            };
-            if recording && has_slot.is_none() {
-                yield I::from_error("a chunk without a source slot followed one with a slot".to_string());
+            let has_slot = chat.sources_mut().map(std::mem::take);
+            if *slot_presence.get_or_insert(has_slot.is_some()) != has_slot.is_some() {
+                // A parser built without recording cannot date its held text.
+                yield I::from_error("the input chunks change whether they carry a source slot".to_string());
                 return;
             }
+            recording = has_slot.is_some();
             let mut input_sources = has_slot.unwrap_or_default();
 
             {
