@@ -56,12 +56,15 @@ pub(crate) fn split_spans(spans: &mut Spans, at: usize) -> Spans {
 /// The parser counts every byte it received. The adapter feeds it the prompt
 /// prefix first (`origin` bytes), then text whose caller ranges it knows. A
 /// parser range before the origin would date prompt bytes as output, so it is
-/// refused.
+/// refused. So is a range whose input bytes differ from the text it dates: the
+/// map keeps the fed text to check that.
 pub(crate) struct FeedMap {
     origin: usize,
     end: usize,
     /// Local start offset and caller range of each fed piece, in feed order.
     pieces: Vec<(usize, Range<usize>)>,
+    /// The text fed after the origin.
+    text: String,
 }
 
 impl FeedMap {
@@ -70,11 +73,13 @@ impl FeedMap {
             origin,
             end: origin,
             pieces: Vec::new(),
+            text: String::new(),
         }
     }
 
-    /// Record that the parser received text tiled by `spans`.
-    pub(crate) fn feed(&mut self, spans: &[Range<usize>]) {
+    /// Record that the parser received `text`, tiled by `spans`.
+    pub(crate) fn feed(&mut self, spans: &[Range<usize>], text: &str) {
+        self.text.push_str(text);
         for range in spans {
             if range.is_empty() {
                 continue;
@@ -84,12 +89,24 @@ impl FeedMap {
         }
     }
 
-    /// Append the caller ranges of the parser's local range `local` to `out`.
-    pub(crate) fn map(&self, local: Range<usize>, out: &mut Spans) -> Result<(), String> {
+    /// Append the caller ranges of the parser's local range `local`, which
+    /// dates the text bytes `expected`, to `out`.
+    pub(crate) fn map(
+        &self,
+        local: Range<usize>,
+        expected: &[u8],
+        out: &mut Spans,
+    ) -> Result<(), String> {
         if local.start < self.origin || local.end > self.end || local.start > local.end {
             return Err(format!(
                 "parser source range {local:?} is outside the fed input {:?}",
                 self.origin..self.end
+            ));
+        }
+        let fed = &self.text.as_bytes()[local.start - self.origin..local.end - self.origin];
+        if fed != expected {
+            return Err(format!(
+                "parser source range {local:?} holds other bytes than the text it dates"
             ));
         }
         if local.is_empty() {
@@ -136,11 +153,12 @@ mod tests {
     #[test]
     fn feed_map_maps_across_pieces_and_refuses_the_prefix() {
         let mut map = FeedMap::new(4);
-        map.feed(&[100..103, 200..202]);
+        map.feed(&[100..103, 200..202], "abcde");
         let mut out = Vec::new();
-        map.map(5..8, &mut out).unwrap();
+        map.map(5..8, b"bcd", &mut out).unwrap();
         assert_eq!(out, vec![101..103, 200..201]);
-        assert!(map.map(3..5, &mut Vec::new()).is_err());
-        assert!(map.map(8..10, &mut Vec::new()).is_err());
+        assert!(map.map(5..8, b"xyz", &mut Vec::new()).is_err());
+        assert!(map.map(3..5, b"ab", &mut Vec::new()).is_err());
+        assert!(map.map(8..10, b"e?", &mut Vec::new()).is_err());
     }
 }

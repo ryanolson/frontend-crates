@@ -799,3 +799,249 @@ fn the_corpus_records_with_the_real_parsers() {
         }
     }
 }
+
+/// A parser that fails to start is not a recording refusal. The stock path
+/// passes the choice through unparsed, and so does a recording stream, with
+/// the input's exact ranges, so recording does not change the chunks.
+#[test]
+fn a_parser_that_fails_to_start_passes_through_as_stock_does() {
+    struct InitFailure(TagParser);
+
+    impl UnifiedParser for InitFailure {
+        fn initialize_request(&mut self, _init: UnifiedParserInit) -> anyhow::Result<()> {
+            anyhow::bail!("injected initialization failure")
+        }
+
+        fn parse_into(&mut self, delta: &str, out: &mut UnifiedParserOutput) -> anyhow::Result<()> {
+            self.0.parse_into(delta, out)
+        }
+
+        fn finish(&mut self) -> anyhow::Result<UnifiedParserOutput> {
+            self.0.finish()
+        }
+
+        fn record_sources(&mut self) -> bool {
+            self.0.record_sources()
+        }
+    }
+
+    let _parser = ParserOverride::install(false);
+    TEST_PARSER.with(|factory| {
+        *factory.borrow_mut() = Some(Box::new(|_, _| Box::new(InitFailure(TagParser::new()))));
+    });
+    let plain = vec![text_chunk(
+        0,
+        Some("<think>private</think>answer"),
+        None,
+        true,
+    )];
+    let expected: Vec<_> = Request::native("glm47")
+        .run(plain.clone())
+        .iter()
+        .map(plain_key)
+        .collect();
+    let (input, texts) = with_slots(&plain);
+    let output = Request::native("glm47").run(input);
+    let actual: Vec<_> = output.iter().map(without_slot).collect();
+    assert_eq!(actual, expected);
+    check_sources(&output, &texts).unwrap();
+    assert_eq!(
+        output[0].data.as_ref().unwrap().slot[0].content,
+        vec![0..28]
+    );
+}
+
+#[test]
+fn recording_refuses_in_bounds_ranges_with_the_wrong_bytes() {
+    struct ShiftedSources(TagParser);
+
+    impl UnifiedParser for ShiftedSources {
+        fn parse_into(&mut self, delta: &str, out: &mut UnifiedParserOutput) -> anyhow::Result<()> {
+            self.0.parse_into(delta, out)
+        }
+
+        fn finish(&mut self) -> anyhow::Result<UnifiedParserOutput> {
+            self.0.finish()
+        }
+
+        fn record_sources(&mut self) -> bool {
+            self.0.record_sources()
+        }
+
+        fn take_sources(&mut self, out: &mut Vec<Range<usize>>) {
+            self.0.take_sources(out);
+            for range in out {
+                if range.start > 0 {
+                    range.start -= 1;
+                    range.end -= 1;
+                }
+            }
+        }
+    }
+
+    let _parser = ParserOverride::install(false);
+    TEST_PARSER.with(|factory| {
+        *factory.borrow_mut() = Some(Box::new(|_, _| Box::new(ShiftedSources(TagParser::new()))));
+    });
+    let (input, texts) = with_slots(&[
+        text_chunk(0, Some("a"), None, false),
+        text_chunk(0, Some("b"), None, true),
+    ]);
+    let output = Request::native("glm47").run(input);
+    assert!(
+        ends_with_error(&output),
+        "recording accepted a range for the wrong byte: {:?}; {output:?}",
+        check_sources(&output, &texts)
+    );
+    check_sources(&output, &texts).unwrap();
+}
+
+#[test]
+fn usage_flush_checks_sources_before_emitting_held_text() {
+    for usage_flush in [false, true] {
+        let _parser = ParserOverride::install(true);
+        let mut input = vec![text_chunk(0, Some("<"), None, false)];
+        if usage_flush {
+            let mut usage = chunk("", false);
+            let data = usage.data.as_mut().unwrap();
+            data.inner.choices.clear();
+            data.inner.usage = Some(
+                serde_json::from_value(json!({
+                    "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2
+                }))
+                .unwrap(),
+            );
+            input.push(usage);
+        }
+        let (input, texts) = with_slots(&input);
+        let output = Request::native("glm47").run(input);
+        assert!(
+            ends_with_error(&output),
+            "usage_flush={usage_flush}: {output:?}"
+        );
+        assert!(
+            check_sources(&output, &texts).is_ok(),
+            "usage_flush={usage_flush}: malformed text was emitted before the error: {:?}; {output:?}",
+            check_sources(&output, &texts)
+        );
+        assert!(no_content_passed_through(&output), "{output:?}");
+    }
+}
+
+thread_local! {
+    static REVIEW_SOURCE_ALLOCATIONS: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+struct SourceReviewAllocator;
+
+unsafe impl std::alloc::GlobalAlloc for SourceReviewAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let pointer = unsafe { std::alloc::System.alloc(layout) };
+        let _ = REVIEW_SOURCE_ALLOCATIONS.try_with(|count| {
+            if let Some((allocations, bytes)) = count.get() {
+                count.set(Some((allocations + 1, bytes + layout.size())));
+            }
+        });
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(pointer, layout) };
+    }
+}
+
+#[global_allocator]
+static SOURCE_REVIEW_ALLOCATOR: SourceReviewAllocator = SourceReviewAllocator;
+
+#[test]
+fn stock_qwen_restoration_allocates_only_the_choice_and_envelope() {
+    let mut item = text_chunk(0, None, Some("queued"), false);
+    let mut data = item.data.take().unwrap();
+    let choice = data.inner.choices.remove(0);
+    let mut record = ChoiceRecord::<Plain>::default();
+    record
+        .pending_qwen_opener_responses
+        .push_back(PendingQwenReasoningResponse {
+            text: "queued".to_string(),
+            spans: Vec::new(),
+            choice,
+            data,
+            annotation: (None, None, None, None),
+        });
+
+    REVIEW_SOURCE_ALLOCATIONS.with(|count| count.set(Some((0, 0))));
+    let restored = take_qwen_reasoning_response(&mut record);
+    let observed = REVIEW_SOURCE_ALLOCATIONS.with(|count| count.replace(None).unwrap());
+    let expected_bytes = std::mem::size_of::<ChatChoiceStream>()
+        + std::mem::size_of::<(NvCreateChatCompletionStreamResponse, AnnotationParts)>();
+    assert_eq!(
+        observed,
+        (2, expected_bytes),
+        "restoring a chunk without a source slot must not allocate a source vector"
+    );
+    assert_eq!(
+        restored.0.inner.choices[0]
+            .delta
+            .reasoning_content
+            .as_deref(),
+        Some("queued")
+    );
+}
+
+#[test]
+fn reset_recovery_keeps_sources_and_matches_the_stock_chunks() {
+    struct FailsAfterHold(TagParser);
+
+    impl UnifiedParser for FailsAfterHold {
+        fn parse_into(&mut self, delta: &str, out: &mut UnifiedParserOutput) -> anyhow::Result<()> {
+            if delta == "!" {
+                anyhow::bail!("injected failure while a marker is held")
+            }
+            self.0.parse_into(delta, out)
+        }
+
+        fn finish(&mut self) -> anyhow::Result<UnifiedParserOutput> {
+            self.0.finish()
+        }
+
+        fn reset(&mut self) -> String {
+            self.0.reset()
+        }
+
+        fn record_sources(&mut self) -> bool {
+            self.0.record_sources()
+        }
+
+        fn take_sources(&mut self, out: &mut Vec<Range<usize>>) {
+            self.0.take_sources(out)
+        }
+    }
+
+    let _parser = ParserOverride::install(false);
+    TEST_PARSER.with(|factory| {
+        *factory.borrow_mut() = Some(Box::new(|_, _| Box::new(FailsAfterHold(TagParser::new()))));
+    });
+    let input = vec![
+        text_chunk(0, Some("a<"), None, false),
+        text_chunk(0, Some("!"), None, false),
+        text_chunk(0, Some("tail"), None, true),
+    ];
+    let request = Request::native("glm47");
+    let expected: Vec<_> = request.run(input.clone()).iter().map(plain_key).collect();
+    let (input, texts) = with_slots(&input);
+    let output = request.run(input);
+    assert_eq!(
+        output.iter().map(without_slot).collect::<Vec<_>>(),
+        expected,
+        "recording changed parser-error recovery"
+    );
+    check_sources(&output, &texts).unwrap();
+    let content: Vec<_> = output
+        .iter()
+        .filter_map(|item| item.data.as_ref())
+        .flat_map(|data| data.slot.iter())
+        .flat_map(|sources| sources.content.iter().cloned())
+        .collect();
+    assert_eq!(content, vec![0..1, 1..2, 3..7]);
+}

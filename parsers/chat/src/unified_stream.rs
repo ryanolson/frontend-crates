@@ -1687,10 +1687,13 @@ impl ChoiceState {
         let mut cursor = 0;
         let mut deltas = Deltas::new(true);
         for event in events {
-            let mut need = match &event {
-                UnifiedParserEvent::Text(text) | UnifiedParserEvent::Reasoning(text) => text.len(),
-                _ => 0,
+            let text = match &event {
+                UnifiedParserEvent::Text(text) | UnifiedParserEvent::Reasoning(text) => {
+                    text.as_bytes()
+                }
+                _ => &[],
             };
+            let mut need = text.len();
             let mut spans = Vec::new();
             while need > 0 {
                 let Some(range) = local.get_mut(cursor) else {
@@ -1701,10 +1704,12 @@ impl ChoiceState {
                     break;
                 };
                 let take = need.min(range.len());
-                if let Err(message) = recording
-                    .fed
-                    .map(range.start..range.start + take, &mut spans)
-                {
+                let done = text.len() - need;
+                if let Err(message) = recording.fed.map(
+                    range.start..range.start + take,
+                    &text[done..done + take],
+                    &mut spans,
+                ) {
                     recording.fail(message);
                 }
                 range.start += take;
@@ -1822,7 +1827,7 @@ impl ChoiceState {
                     text.len()
                 ));
             }
-            recording.fed.feed(&spans);
+            recording.fed.feed(&spans, text);
         }
         let mut output = UnifiedParserOutput::default();
         match self.parser.parse_into(text, &mut output) {
@@ -2004,8 +2009,15 @@ impl ChoiceState {
         let mut spans = Vec::new();
         if let Some(recording) = self.recording.as_deref_mut() {
             self.parser.take_sources(&mut recording.scratch);
+            let mut done = 0;
             for range in recording.scratch.drain(..) {
-                if let Err(message) = recording.fed.map(range, &mut spans) {
+                let expected = recovered.as_bytes().get(done..done + range.len());
+                done += range.len();
+                let result = match expected {
+                    Some(expected) => recording.fed.map(range, expected, &mut spans),
+                    None => Err("reset sources cover more bytes than the reset text".to_string()),
+                };
+                if let Err(message) = result {
                     recording.error.get_or_insert(message);
                 }
             }
@@ -2591,14 +2603,13 @@ fn take_qwen_reasoning_response<I: UnifiedStreamItem>(
     let mut source_reasoning = pending.choice;
     source_reasoning.delta.reasoning_content = Some(pending.text);
     source_reasoning.finish_reason = None;
-    write_slot(
-        &mut data,
-        vec![ChoiceSources {
+    if let Some(slot) = data.sources_mut() {
+        *slot = vec![ChoiceSources {
             index: source_reasoning.index,
             content: Vec::new(),
             reasoning: pending.spans,
-        }],
-    );
+        }];
+    }
     data.inner_mut().choices = vec![source_reasoning];
     Box::new((data, pending.annotation))
 }
@@ -3149,7 +3160,13 @@ where
                     for (choice, sources) in flush_undecided_guided_prefixes(&mut undecided_guided_prefix, &mut undecided_spans, policy, prefill) {
                         yield response_with_choice(template, choice, recording.then_some(sources), &states, &records);
                     }
-                    for output in finish_unterminated_choices(&mut states, &mut records, family, policy.parsers_v2_selected, recording) {
+                    let finished = finish_unterminated_choices(&mut states, &mut records, family, policy.parsers_v2_selected, recording);
+                    // Check before emitting: a failed choice's flushed text is undated.
+                    if let Some(error) = states.values_mut().find_map(ChoiceState::take_recording_error) {
+                        yield I::from_error(error);
+                        return;
+                    }
+                    for output in finished {
                         match output {
                             FinishedStreamChunk::Choice(choice) => {
                                 yield response_with_choice(template, choice, None, &states, &records);
@@ -3160,10 +3177,6 @@ where
                             }
                             FinishedStreamChunk::Source(response) => yield normalized_source_response(*response, &states, &records),
                         }
-                    }
-                    if let Some(error) = states.values_mut().find_map(ChoiceState::take_recording_error) {
-                        yield I::from_error(error);
-                        return;
                     }
                 }
                 for evidence in chat.tool_call_completion_mut() {
