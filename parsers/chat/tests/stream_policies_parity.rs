@@ -743,3 +743,47 @@ async fn dynamo_llm_test_streams_match() {
             .join("\n")
     );
 }
+
+#[tokio::test]
+#[ignore = "F1: recorded_jail ignores JailRequest and accepts a changed guided_streaming flag"]
+async fn f1_recorded_jail_rejects_changed_guided_streaming() {
+    let record = read_fixture(include_bytes!("data/dynamo_llm_tests_capture.jsonl.gz"))
+        .into_iter()
+        .find(|record| record["name"] == "minimax_m2_disabled_named_json_returns_tool_call#2")
+        .expect("recorded guided-JSON jail call");
+    let request = RecordedRequest::new(&record["request"]);
+    let constraint: GuidedToolConstraint =
+        serde_json::from_value(record["constraint"].clone()).unwrap();
+    assert!(constraint.installs_guided_json());
+    assert_eq!(record["guided_tool_streaming_disabled"], json!(false));
+
+    // The recorded request is the control; only the release flag changes.
+    for guided_streaming in [true, false] {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let output: Vec<_> = recorded_jail(record.get("jail").cloned(), Arc::clone(&errors))(
+            Box::pin(stream::iter(items(&record["jail"]["input"]))),
+            JailRequest {
+                tool_call_parser: record["route"]["legacy_jail"].as_str().map(str::to_string),
+                tool_choice: request.inner.tool_choice.clone(),
+                tool_definitions: Some(tool_definitions(&record["tool_definitions"])),
+                uses_tool_call_structural_tag: constraint.uses_structural_tag(),
+                guided_streaming,
+            },
+        )
+        .collect()
+        .await;
+
+        if guided_streaming {
+            assert!(errors.lock().unwrap().is_empty());
+            assert_eq!(
+                json!(output.iter().map(to_compact).collect::<Vec<_>>()),
+                record["jail"]["output"]
+            );
+        } else {
+            assert!(
+                !errors.lock().unwrap().is_empty(),
+                "replay accepted guided_streaming=false for a capture made with guided_streaming=true"
+            );
+        }
+    }
+}
