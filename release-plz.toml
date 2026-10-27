@@ -46,6 +46,12 @@ name = "dynamo-parsers-v2-py"
 publish = false
 release = false
 
+# New crate: keep it out of automated releases until its first manual publish
+# (RELEASING.md, "First release of a new crate").
+[[package]]
+name = "dynamo-chat-parsing"
+release = false
+
 [changelog]
 header = """# Changelog
 
