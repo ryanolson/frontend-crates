@@ -11,13 +11,18 @@ exclude = ["tests/glm47_schema_conformance.rs"]
 
 [features]
 test-utils = []
+# serde_json's `arbitrary_precision`, for a consumer that wants number text
+# kept as sent. Off by default: Cargo turns it on for every crate in the
+# build, and it changes how all of them read and write numbers
+# (`tests/serde_json_features.rs`).
+arbitrary-precision = ["serde_json/arbitrary_precision"]
 
 [dependencies]
 dynamo-structural-tag.workspace = true
 openai-harmony = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, features = ["arbitrary_precision", "raw_value"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 serde_yaml = "0.9"
 regex = { workspace = true }
 tracing = { workspace = true }
