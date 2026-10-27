@@ -1119,13 +1119,19 @@ name = "dynamo-chat-parsing"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "dynamo-parsers",
  "dynamo-parsers-v2",
  "dynamo-protocols",
  "dynamo-renderer",
+ "flate2",
+ "futures",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

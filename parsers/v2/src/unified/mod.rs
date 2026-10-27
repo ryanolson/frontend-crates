@@ -464,6 +464,19 @@ pub trait UnifiedParser: Send {
     fn tool_call_id(&self, _tool_index: usize) -> Option<&str> {
         None
     }
+
+    /// Record where committed text came from. Call before the first parse.
+    ///
+    /// Returns `false` when this parser cannot, so the caller can refuse the
+    /// request. The default cannot.
+    fn record_sources(&mut self) -> bool {
+        false
+    }
+
+    /// Move the input byte ranges of the Text and Reasoning bytes committed since
+    /// the last call into `out`, in output order. Offsets count every byte this
+    /// parser received. The default records nothing.
+    fn take_sources(&mut self, _out: &mut Vec<std::ops::Range<usize>>) {}
 }
 
 /// Allocation conveniences over the required [`UnifiedParser`] lifecycle.
