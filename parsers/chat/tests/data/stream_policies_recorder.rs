@@ -38,6 +38,7 @@ type Item = Annotated<NvCreateChatCompletionStreamResponse>;
 
 #[derive(Default)]
 struct JailTap {
+    request: Value,
     input: Vec<Value>,
     input_ended: bool,
     output: Vec<Value>,
@@ -45,6 +46,12 @@ struct JailTap {
 }
 
 static JAIL_TAP: Mutex<Option<JailTap>> = Mutex::new(None);
+
+pub(super) fn tap_jail_request(request: Value) {
+    if let Some(tap) = JAIL_TAP.lock().unwrap().as_mut() {
+        tap.request = request;
+    }
+}
 
 pub(super) fn tap_jail_input<S>(stream: S) -> Pin<Box<dyn Stream<Item = Item> + Send>>
 where
@@ -796,6 +803,7 @@ async fn stream_policies_recorder() {
         let tap = JAIL_TAP.lock().unwrap().take().unwrap();
         if tap.called {
             record["jail"] = json!({
+                "request": tap.request,
                 "input": tap.input,
                 "input_ended": tap.input_ended,
                 "output": tap.output,

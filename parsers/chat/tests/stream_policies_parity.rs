@@ -30,9 +30,10 @@
 //! and `2`. The file holds every record of the first run, and each record of
 //! the other runs that differs from the first. Each record names its version.
 //!
-//! The v1 tool-call jail stays in dynamo, so the recorder also kept what the
-//! jail received and what it sent. This test passes a jail that checks it gets
-//! the same input and replays the same output. So a `LegacyJail` record tests
+//! The v1 tool-call jail stays in dynamo, so the recorder also kept the
+//! jail's arguments, what it received, and what it sent. This test passes a
+//! jail that checks it gets the same arguments and input, and replays the same
+//! output. So a `LegacyJail` record tests
 //! every stage here around dynamo's jail.
 //!
 //! `tests/data/dynamo_llm_tests_capture.jsonl.gz` holds the same kind of
@@ -491,8 +492,28 @@ fn tool_definitions(value: &Value) -> Vec<ToolDefinition> {
         .collect()
 }
 
-/// A jail that checks it receives what dynamo's jail received, then sends
-/// what dynamo's jail sent.
+/// [`JailRequest`] in the form the recorder wrote.
+fn jail_request_json(request: &JailRequest) -> Value {
+    json!({
+        "tool_call_parser": request.tool_call_parser,
+        "tool_choice": request.tool_choice,
+        "tool_definitions": request.tool_definitions.as_ref().map(|tools| {
+            tools
+                .iter()
+                .map(|tool| json!({
+                    "name": tool.name,
+                    "parameters": tool.parameters,
+                    "strict": tool.strict,
+                }))
+                .collect::<Vec<_>>()
+        }),
+        "uses_tool_call_structural_tag": request.uses_tool_call_structural_tag,
+        "guided_streaming": request.guided_streaming,
+    })
+}
+
+/// A jail that checks it gets the arguments and the input that dynamo's jail
+/// got, then sends what dynamo's jail sent.
 fn recorded_jail(
     recorded: Option<Value>,
     calls: Arc<Mutex<Vec<String>>>,
@@ -505,6 +526,14 @@ fn recorded_jail(
                 .push(format!("jail called, dynamo did not call it: {request:?}"));
             return Box::pin(stream::empty());
         };
+        let got = jail_request_json(&request);
+        if got != recorded["request"] {
+            calls.lock().unwrap().push(format!(
+                "jail request: got {got}, dynamo {}",
+                recorded["request"]
+            ));
+            return Box::pin(stream::empty());
+        }
         Box::pin(async_stream::stream! {
             let expected = recorded["input"].as_array().unwrap().clone();
             for (index, want) in expected.iter().enumerate() {
@@ -744,9 +773,10 @@ async fn dynamo_llm_test_streams_match() {
     );
 }
 
+/// The replayed jail must refuse arguments dynamo's jail did not get, or the
+/// replay could not catch a wrong `JailRequest`.
 #[tokio::test]
-#[ignore = "F1: recorded_jail ignores JailRequest and accepts a changed guided_streaming flag"]
-async fn f1_recorded_jail_rejects_changed_guided_streaming() {
+async fn recorded_jail_rejects_changed_guided_streaming() {
     let record = read_fixture(include_bytes!("data/dynamo_llm_tests_capture.jsonl.gz"))
         .into_iter()
         .find(|record| record["name"] == "minimax_m2_disabled_named_json_returns_tool_call#2")

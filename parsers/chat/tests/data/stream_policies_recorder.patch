@@ -1,5 +1,5 @@
 diff --git a/lib/llm/src/preprocessor.rs b/lib/llm/src/preprocessor.rs
-index 25a58a636f..c80585f724 100644
+index 25a58a636f..47d0ae4e1e 100644
 --- a/lib/llm/src/preprocessor.rs
 +++ b/lib/llm/src/preprocessor.rs
 @@ -5326,6 +5326,14 @@ impl OpenAIPreprocessor {
@@ -37,11 +37,21 @@ index 25a58a636f..c80585f724 100644
              ));
          }
  
-@@ -5537,14 +5548,21 @@ impl OpenAIPreprocessor {
+@@ -5537,14 +5548,31 @@ impl OpenAIPreprocessor {
                  // jail keeps its own native fallback, so a backend that ignores the
                  // grammar (MiniMax M2 emits XML under `required`) still parses normally.
                  // Same request-scoped decision the unified path above was given.
 -                Box::pin(Self::apply_tool_calling_jail(
++                let jail_request = stream_policies_capture::jail_request_json(
++                    effective_tool_call_parser.as_deref(),
++                    request.inner.tool_choice.as_ref(),
++                    tool_definitions.as_deref(),
++                    uses_tool_call_structural_tag,
++                    guided_tool_streaming,
++                );
++                #[cfg(test)]
++                stream_policies_recorder::tap_jail_request(jail_request.clone());
++                stream_policies_capture::set(&capture, "jail_request", jail_request);
 +                #[cfg(test)]
 +                let stream = stream_policies_recorder::tap_jail_input(stream);
 +                let stream = stream_policies_capture::tap(&capture, "jail_input", stream);
@@ -61,7 +71,7 @@ index 25a58a636f..c80585f724 100644
              }
              ToolProcessingRoute::PassThrough => Box::pin(stream),
              ToolProcessingRoute::Unified(_) => {
-@@ -5552,9 +5570,9 @@ impl OpenAIPreprocessor {
+@@ -5552,9 +5580,9 @@ impl OpenAIPreprocessor {
              }
          };
  
@@ -74,7 +84,7 @@ index 25a58a636f..c80585f724 100644
          ))
      }
  
-@@ -17281,3 +17299,10 @@ mod tests {
+@@ -17281,3 +17309,10 @@ mod tests {
          ]));
      }
  }

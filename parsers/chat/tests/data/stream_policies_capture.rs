@@ -191,6 +191,38 @@ pub(super) fn start(
     Some(Arc::new(Mutex::new(record)))
 }
 
+/// The arguments S10 passes to the v1 jail.
+pub(super) fn jail_request_json(
+    tool_call_parser: Option<&str>,
+    tool_choice: Option<&dynamo_protocols::types::ChatCompletionToolChoiceOption>,
+    tool_definitions: Option<&[dynamo_parsers::tool_calling::ToolDefinition]>,
+    uses_tool_call_structural_tag: bool,
+    guided_streaming: bool,
+) -> Value {
+    json!({
+        "tool_call_parser": tool_call_parser,
+        "tool_choice": tool_choice,
+        "tool_definitions": tool_definitions.map(|tools| {
+            tools
+                .iter()
+                .map(|tool| json!({
+                    "name": tool.name,
+                    "parameters": tool.parameters,
+                    "strict": tool.strict,
+                }))
+                .collect::<Vec<_>>()
+        }),
+        "uses_tool_call_structural_tag": uses_tool_call_structural_tag,
+        "guided_streaming": guided_streaming,
+    })
+}
+
+pub(super) fn set(capture: &Capture, key: &str, value: Value) {
+    if let Some(capture) = capture {
+        capture.lock().unwrap().insert(key.to_string(), value);
+    }
+}
+
 fn push(capture: &Capture, key: &str, item: &Item) {
     if let Some(capture) = capture {
         let mut record = capture.lock().unwrap();
@@ -240,9 +272,10 @@ where
             if let Some(input) = record.remove("jail_input") {
                 let ended = record.remove("jail_input_ended").unwrap_or(json!(false));
                 let output = record.remove("jail_output").unwrap_or(json!([]));
+                let request = record.remove("jail_request").unwrap_or(Value::Null);
                 record.insert(
                     "jail".into(),
-                    json!({"input": input, "input_ended": ended, "output": output}),
+                    json!({"request": request, "input": input, "input_ended": ended, "output": output}),
                 );
             }
             record.remove("input_ended");
