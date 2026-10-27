@@ -43,7 +43,9 @@ fn guided_required(arguments: &str) -> Result<Option<String>, String> {
         })
         .unwrap();
     let mut events = parser
-        .push(&format!(r#"[{{"name":"inspect","arguments":{arguments}}}]"#))
+        .push(&format!(
+            r#"[{{"name":"inspect","arguments":{arguments}}}]"#
+        ))
         .unwrap();
     let finished = parser.finish().map_err(|error| error.to_string())?;
     events.extend(finished.events);
