@@ -826,7 +826,8 @@ fn the_corpus_records_without_changing_a_chunk() {
         // A replayed prompt prefix that leaves bytes held refuses to record,
         // before any generated output: those prompt bytes could surface as
         // text, and they have no offset in the generated input. Gemma 4 does
-        // this for a partial `thought` label, and so does the test parser.
+        // this for any prefix short of the whole `<|channel>thought\n` header,
+        // and so does the test parser.
         if name.starts_with("gemma_prefix/")
             && output.iter().any(|item| {
                 item.error
