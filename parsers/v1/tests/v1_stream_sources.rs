@@ -631,3 +631,127 @@ async fn review_f3_jail_dates_duplicate_choices_in_caller_offsets() {
         "each duplicate choice has its own caller ranges"
     );
 }
+
+#[tokio::test]
+async fn review_f5_contentless_duplicate_does_not_steal_text_sources() {
+    let mut violations = Vec::new();
+    for (stage, text) in [
+        (
+            json!({"kind": "reasoning", "reasoning_parser": "qwen3", "options": {}}),
+            "<think>R</think>A",
+        ),
+        (
+            json!({"kind": "strip", "think_start_token": "<think>"}),
+            "<think>A",
+        ),
+        (
+            json!({"kind": "jail", "tool_call_parser": "hermes", "options": {}}),
+            "A",
+        ),
+    ] {
+        let input = to_item(&json!({"data": {"choices": [
+            {"index": 0, "delta": {"role": "assistant"}},
+            {"index": 0, "delta": {"content": text}}
+        ]}}));
+        let mut complete = with_sources(&[input]);
+        let control = run_sourced(&stage, complete.clone()).await;
+        let totals = |items: &[(SourcedChunk, usize)]| {
+            let mut text_bytes = (0, 0);
+            let mut source_bytes = (0, 0);
+            for (item, _) in items {
+                for choice in &item.chunk().unwrap().choices {
+                    text_bytes.0 += text_of(&choice.delta.content).len();
+                    text_bytes.1 += choice
+                        .delta
+                        .reasoning_content
+                        .as_ref()
+                        .map_or(0, String::len);
+                }
+                for entry in item.sources().unwrap() {
+                    source_bytes.0 += entry.content.iter().map(|range| range.len()).sum::<usize>();
+                    source_bytes.1 += entry
+                        .reasoning
+                        .iter()
+                        .map(|range| range.len())
+                        .sum::<usize>();
+                }
+            }
+            (text_bytes, source_bytes)
+        };
+        let (text_bytes, source_bytes) = totals(&control);
+        assert_eq!(text_bytes, source_bytes, "complete entries are the control");
+
+        // A choice with no text needs no entry. The only entry belongs to text.
+        complete[0].sources.as_mut().unwrap().remove(0);
+        let output = run_sourced(&stage, complete).await;
+        assert_eq!(
+            shape(
+                &control
+                    .iter()
+                    .map(|(item, _)| item.chunk.clone())
+                    .collect::<Vec<_>>()
+            ),
+            shape(
+                &output
+                    .iter()
+                    .map(|(item, _)| item.chunk.clone())
+                    .collect::<Vec<_>>()
+            ),
+        );
+        let (text_bytes, source_bytes) = totals(&output);
+        if text_bytes != source_bytes {
+            violations.push((
+                stage["kind"].as_str().unwrap().to_string(),
+                text_bytes,
+                source_bytes,
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "contentless duplicates break tiling (stage, text bytes, source bytes): {violations:?}"
+    );
+}
+#[tokio::test]
+async fn review_f7_synthetic_jail_terminal_stays_unsourced() {
+    let stage = json!({"kind": "jail", "tool_call_parser": "hermes", "options": {}});
+    let input = to_item(&json!({"data": {"choices": [{
+        "index": 0,
+        "delta": {"content": "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>"}
+    }]}}));
+    let control = run_sourced(&stage, with_sources(std::slice::from_ref(&input))).await;
+    assert!(control.iter().any(|(item, _)| {
+        item.chunk()
+            .unwrap()
+            .choices
+            .iter()
+            .any(|choice| choice.finish_reason.is_some())
+    }));
+    assert!(
+        control
+            .iter()
+            .all(|(item, _)| item.sources().unwrap().len() == item.chunk().unwrap().choices.len())
+    );
+
+    let output = run_sourced(
+        &stage,
+        vec![SourcedChunk {
+            chunk: input,
+            sources: Some(vec![]),
+        }],
+    )
+    .await;
+    assert!(output.iter().any(|(item, _)| {
+        item.chunk()
+            .unwrap()
+            .choices
+            .iter()
+            .any(|choice| choice.delta.tool_calls.is_some())
+    }));
+    for (item, _) in output {
+        assert!(
+            item.sources().unwrap().is_empty(),
+            "an unsourced choice regains an entry: {item:?}"
+        );
+    }
+}
