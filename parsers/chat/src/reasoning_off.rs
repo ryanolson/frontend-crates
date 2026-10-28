@@ -189,6 +189,9 @@ pub fn is_reasoning_disabled_by_request(
 /// When the request turned reasoning off, fold each choice's
 /// `reasoning_content` into the front of its text `content`. A choice whose
 /// content is a list of parts keeps both fields as they are.
+///
+/// While the items carry a source slot, each folded choice's reasoning ranges
+/// move to the front of its content ranges, as its text does.
 pub(crate) fn fold_reasoning_into_content<I, S>(
     stream: S,
     reasoning_disabled: bool,
@@ -198,7 +201,11 @@ where
     S: Stream<Item = I> + Send + 'static,
 {
     stream.map(move |mut response| {
-        if reasoning_disabled && let Some(data) = response.chunk_mut() {
+        if !reasoning_disabled {
+            return response;
+        }
+        let mut sources = response.sources_mut().map(std::mem::take);
+        if let Some(data) = response.chunk_mut() {
             for choice in &mut data.choices {
                 if let Some(reasoning) = choice.delta.reasoning_content.take() {
                     let text = match choice.delta.content.take() {
@@ -213,8 +220,21 @@ where
                     choice.delta.content = Some(ChatCompletionMessageContent::Text(format!(
                         "{reasoning}{text}"
                     )));
+                    if let Some(entry) = sources
+                        .as_mut()
+                        .and_then(|all| all.iter_mut().find(|entry| entry.index == choice.index))
+                    {
+                        let mut content = std::mem::take(&mut entry.reasoning);
+                        content.append(&mut entry.content);
+                        entry.content = content;
+                    }
                 }
             }
+        }
+        if let Some(sources) = sources
+            && let Some(slot) = response.sources_mut()
+        {
+            *slot = sources;
         }
         response
     })
