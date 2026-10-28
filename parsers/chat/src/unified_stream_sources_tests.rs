@@ -580,13 +580,14 @@ fn no_content_passed_through(output: &[Recorded]) -> bool {
 
 #[test]
 fn a_parser_that_cannot_record_fails_the_stream() {
-    // No override: the real family parser keeps the trait default and refuses.
+    // No override: Kimi K3's real parser cannot record exact ranges, so it
+    // refuses (dynamo-parsers-v2 `UnifiedParser::record_sources`).
     let (input, _) = with_slots(&split("<think>r</think>visible text", 4));
-    let output = Request::native("glm47").run(input);
+    let output = Request::native("kimi_k3").run(input);
     assert!(ends_with_error(&output), "{output:?}");
     assert!(no_content_passed_through(&output), "{output:?}");
     // The stock path is unchanged: the same input without slots parses.
-    let plain = Request::native("glm47").run(split("<think>r</think>visible text", 4));
+    let plain = Request::native("kimi_k3").run(split("<think>r</think>visible text", 4));
     assert!(!plain.iter().any(Annotated::is_error));
 }
 

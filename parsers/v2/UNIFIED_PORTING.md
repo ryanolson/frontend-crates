@@ -17,6 +17,7 @@ Everything below is already generic in `src/tool_calling/scan.rs` — do NOT rei
 - guided-JSON decoding, including the reasoning envelope around the payload
 - a grammar-aware invoke scan for families whose markers cannot delimit a call on their own (`InvokeScan`)
 - an optional structural role label after the reasoning opener (`ReasoningSpec::start_label`)
+- source recording (`record_sources`, `take_sources`): the input byte range of every committed Text and Reasoning byte, when the caller turns it on
 
 The last two are the gemma4 port's contribution. Reach for them before writing a
 bespoke drain — the whole point of Tier C was to find out whether the shared loop
@@ -128,6 +129,8 @@ families had no unified parser to run them, and unfixable-looking the moment one
 Render guided inputs once for every family (`every_family` in `gen_unified_golden.py`),
 not per family.
 
+**Source recording assumes the scanner's buffer rules.** The scanner appends input at the back of `buffer` and drains it from the front, and it commits text only as a copy of a buffer prefix. So `fed - buffer.len()` is always the input offset of `buffer[0]`. Bytes that `reset` returns wait in `uncommitted_block`, which keeps their ranges beside them. A family hook that commits text from anywhere else breaks recording. `conformance/tests/unified_source_ranges.rs` catches that at every split.
+
 **Nothing outside `parsers/v2` and `conformance/` consumes `UnifiedParser` yet.** The conformance harness builds `UnifiedParserInit` with `RecoverAsText`; a serving integration should build the same one owned object after prompt rendering and backend request resolution, leaving the default invalid-guided-payload policy at `Reject`. This keeps prompt tokens, starting state, output mode, and failure policy under one initialization owner. Test that object at the serving boundary, not only inside the parser.
 
 ## Checklist
@@ -135,11 +138,12 @@ not per family.
 1. Extract `<family>_scanner(tools)` and make it the only grammar/state owner. Delete the existing tool-only drain state; if the `ToolParser` registry needs compatibility, replace it with a thin UnifiedParser event projection. If that changes tool-only behavior, `parity_toolcalling_stream` says so — a clean run there is what proves the port was a refactor and not a rewrite.
 2. Add `unified/<family>.rs` with the factory and its `ReasoningSpec`.
 3. Add one line to `unified_registry!` in `unified/mod.rs`.
-4. Add the `unified:` row in `conformance/utils/src/parser_families.yaml` — `native: true` once the factory exists, or `a_unified_family_is_never_annotated_as_diverging` fails with annotations still claiming the split path's behavior.
-5. Add the family's inputs to `conformance/utils/src/gen_unified_golden.py` so every scenario gets one in that grammar.
-6. Bump `parsers/v2/Cargo.toml` to the release that carries the conversion before capture. Run the Unified golden generator and live capture, then `explode` → `package` → catalog refresh (`python3 conformance/utils/src/viewer_catalog.py`). The capture drift guard fails if the committed shard disagrees with the live parser. Reload the maintained root browser viewer over HTTP; do not generate a standalone HTML report.
-7. Check `7-2` and `12-1`/`12-2` specifically — argument fidelity and adversarial nesting are where a re-wrapping emitter and a reasoning-first assumption break.
-8. Re-capture the PEERS if any input changed. Peer shards are keyed by case id, so a changed input leaves their cells showing output captured from text that no longer exists. `vllm_python` + `sglang_python` run in their containers; `vllm_rust` needs a vLLM source tree on the host.
-9. Verify what the page SHOWS, not just what the model contains. Run `conformance/utils/check.sh status --model <family> --tab unified`; the affected row must report zero red and zero empty current Dynamo cells. A cell can hold the right data and render nothing.
+4. Add the family to `RECORDING` or `REFUSING` in `conformance/tests/unified_source_ranges.rs`. A family on `ScannerUnified` records; `every_family_is_ruled_on` fails until it is listed.
+5. Add the `unified:` row in `conformance/utils/src/parser_families.yaml` — `native: true` once the factory exists, or `a_unified_family_is_never_annotated_as_diverging` fails with annotations still claiming the split path's behavior.
+6. Add the family's inputs to `conformance/utils/src/gen_unified_golden.py` so every scenario gets one in that grammar.
+7. Bump `parsers/v2/Cargo.toml` to the release that carries the conversion before capture. Run the Unified golden generator and live capture, then `explode` → `package` → catalog refresh (`python3 conformance/utils/src/viewer_catalog.py`). The capture drift guard fails if the committed shard disagrees with the live parser. Reload the maintained root browser viewer over HTTP; do not generate a standalone HTML report.
+8. Check `7-2` and `12-1`/`12-2` specifically — argument fidelity and adversarial nesting are where a re-wrapping emitter and a reasoning-first assumption break.
+9. Re-capture the PEERS if any input changed. Peer shards are keyed by case id, so a changed input leaves their cells showing output captured from text that no longer exists. `vllm_python` + `sglang_python` run in their containers; `vllm_rust` needs a vLLM source tree on the host.
+10. Verify what the page SHOWS, not just what the model contains. Run `conformance/utils/check.sh status --model <family> --tab unified`; the affected row must report zero red and zero empty current Dynamo cells. A cell can hold the right data and render nothing.
 
-Steps 1-4 are the port. Step 5 is the bulk of the work today — one input per scenario per family, ~23 strings. That does not scale to many families and is tracked separately: the fix is a per-family grammar spec that RENDERS the canonical scenarios instead of authoring them by hand.
+Steps 1-5 are the port. Step 6 is the bulk of the work today — one input per scenario per family, ~23 strings. That does not scale to many families and is tracked separately: the fix is a per-family grammar spec that RENDERS the canonical scenarios instead of authoring them by hand.

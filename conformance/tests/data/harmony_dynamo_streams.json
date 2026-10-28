@@ -1,0 +1,764 @@
+{
+ "source": "ai-dynamo/dynamo 4943a661599e87e6ab7101be81774e605314d232",
+ "streams": [
+  {
+   "id": "recorded/sglang/chat_completion_stream_19c97899-tool.json",
+   "chunks": [
+    "<|channel|>",
+    "analysis",
+    "<|message|>",
+    "We",
+    " need",
+    " to",
+    " call",
+    " the",
+    " get",
+    "_weather",
+    " function",
+    ".",
+    " The",
+    " user",
+    " wants",
+    " weather",
+    " in",
+    " Tokyo",
+    " in",
+    " Celsius",
+    ".",
+    " So",
+    " we",
+    " call",
+    " get",
+    "_weather",
+    " with",
+    " location",
+    " \"",
+    "Tokyo",
+    "\"",
+    " and",
+    " unit",
+    " \"",
+    "c",
+    "elsius",
+    "\".",
+    "<|end|>",
+    "<|start|>",
+    "assistant",
+    "<|channel|>",
+    "comment",
+    "ary",
+    " to",
+    "=",
+    "functions",
+    ".get",
+    "_weather",
+    " ",
+    "<|constrain|>",
+    "json",
+    "<|message|>",
+    "{\"",
+    "location",
+    "\":\"",
+    "Tokyo",
+    "\",\"",
+    "unit",
+    "\":\"",
+    "c",
+    "elsius",
+    "\"}",
+    "<|call|>"
+   ]
+  },
+  {
+   "id": "recorded/sglang/chat_completion_stream_675195a8-no-tool.json",
+   "chunks": [
+    "<|channel|>",
+    "analysis",
+    "<|message|>",
+    "We",
+    " need",
+    " to",
+    " produce",
+    " a",
+    " short",
+    " joke",
+    " about",
+    " programming",
+    ".",
+    " Just",
+    " a",
+    " joke",
+    ".",
+    " Probably",
+    " something",
+    " like",
+    " \"",
+    "Why",
+    " do",
+    " programmers",
+    " prefer",
+    " dark",
+    " mode",
+    "?",
+    " Because",
+    " light",
+    " attracts",
+    " bugs",
+    ".\"",
+    " Or",
+    " \"",
+    "Why",
+    " do",
+    " programmers",
+    " hate",
+    " nature",
+    "?",
+    " It",
+    " has",
+    " too",
+    " many",
+    " bugs",
+    ".\"",
+    " Or",
+    " \"",
+    "How",
+    " many",
+    " programmers",
+    " does",
+    " it",
+    " take",
+    " to",
+    " change",
+    " a",
+    " light",
+    " bulb",
+    "?",
+    " None",
+    ",",
+    " that's",
+    " a",
+    " hardware",
+    " problem",
+    ".\"",
+    " The",
+    " user",
+    " just",
+    " asked",
+    " for",
+    " a",
+    " short",
+    " joke",
+    ".",
+    " So",
+    " we",
+    " can",
+    " give",
+    " a",
+    " short",
+    " one",
+    "-l",
+    "iner",
+    ".",
+    " Probably",
+    " keep",
+    " it",
+    " short",
+    ".",
+    " We'll",
+    " output",
+    " a",
+    " joke",
+    ".",
+    "<|end|>",
+    "<|start|>",
+    "assistant",
+    "<|channel|>",
+    "final",
+    "<|message|>",
+    "Why",
+    " do",
+    " programmers",
+    " always",
+    " mix",
+    " up",
+    " Halloween",
+    " and",
+    " Christmas",
+    "?",
+    "  \n\n",
+    "Because",
+    " Oct",
+    " ",
+    "31",
+    " ",
+    "==",
+    " ",
+    "Dec",
+    " ",
+    "25",
+    "."
+   ]
+  },
+  {
+   "id": "recorded/vllm/chat_completion_stream_49f581c1-no-tool.json",
+   "chunks": [
+    "<|channel|>",
+    "analysis",
+    "<|message|>",
+    "User",
+    " asks",
+    ":",
+    " \"",
+    "How",
+    "'s",
+    " your",
+    " day",
+    " going",
+    " in",
+    " NYC",
+    "?\"",
+    " The",
+    " AI",
+    " isn't",
+    " in",
+    " NYC",
+    " physically",
+    ";",
+    " we",
+    " can",
+    " answer",
+    " gener",
+    "ically",
+    " and",
+    " humor",
+    ".",
+    " Possibly",
+    " ask",
+    " for",
+    " clar",
+    "ifications",
+    "?",
+    " Ask",
+    " them",
+    ".",
+    " There's",
+    " no",
+    " mention",
+    " of",
+    " a",
+    " system",
+    " prompt",
+    ".",
+    " We'll",
+    " respond",
+    " politely",
+    ",",
+    " inform",
+    " that",
+    " I'm",
+    " an",
+    " AI",
+    " not",
+    " physical",
+    ".",
+    "<|end|>",
+    "<|start|>",
+    "assistant",
+    "<|channel|>",
+    "final",
+    "<|message|>",
+    "I",
+    "’m",
+    " not",
+    " actually",
+    " out",
+    " in",
+    " NYC",
+    " (",
+    "I",
+    " don",
+    "’t",
+    " have",
+    " a",
+    " physical",
+    " body",
+    " or",
+    " a",
+    " day",
+    " of",
+    " my",
+    " own",
+    "),",
+    " but",
+    " I",
+    " can",
+    " share",
+    " a",
+    " bit",
+    " of",
+    " the",
+    " city",
+    "’s",
+    " vibe",
+    " if",
+    " you",
+    " like",
+    "!",
+    " 🌆",
+    "\n\n",
+    "-",
+    " **",
+    "Weather",
+    "**",
+    ":",
+    " Spring",
+    " is",
+    " usually",
+    " mild",
+    " in",
+    " the",
+    " borough",
+    "s",
+    ";",
+    " temperatures",
+    " average",
+    " around",
+    " ",
+    "60",
+    "–",
+    "70",
+    "°F",
+    " (",
+    "15",
+    "–",
+    "21",
+    "°C",
+    "),",
+    " with",
+    " a",
+    " chance",
+    " of",
+    " a",
+    " light",
+    " drizzle",
+    "—",
+    "perfect",
+    " for",
+    " a",
+    " coffee",
+    "‑",
+    "shop",
+    " stroll",
+    ".\n",
+    "-",
+    " **",
+    "Traffic",
+    "**",
+    ":",
+    " Downtown",
+    " meetings",
+    " are",
+    " usually",
+    " more",
+    " packed",
+    " on",
+    " Monday",
+    " mornings",
+    ",",
+    " but",
+    " the",
+    " Outer",
+    "‑",
+    "West",
+    " side",
+    " tends",
+    " to",
+    " smooth",
+    " out",
+    " a",
+    " bit",
+    " by",
+    " mid",
+    "‑",
+    "day",
+    ".\n",
+    "-",
+    " **",
+    "Culture",
+    "**",
+    ":",
+    " The",
+    " Museum",
+    " of",
+    " Modern",
+    " Art",
+    " opened",
+    " a",
+    " new",
+    " exhibit",
+    " this",
+    " week",
+    ",",
+    " and",
+    " the",
+    " “",
+    "Broad",
+    "way",
+    " Fever",
+    "”",
+    " festival",
+    " brings",
+    " a",
+    " mix",
+    " of",
+    " musical",
+    " performances",
+    " to",
+    " Times",
+    " Square",
+    ".\n\n",
+    "Let",
+    " me",
+    " know",
+    " if",
+    " you",
+    "’d",
+    " like",
+    " the",
+    " current",
+    " weather",
+    " for",
+    " a",
+    " specific",
+    " borough",
+    " or",
+    " anything",
+    " else",
+    " about",
+    " NYC",
+    "—",
+    "happy",
+    " to",
+    " help",
+    " make",
+    " your",
+    " day",
+    " a",
+    " little",
+    " brighter",
+    "!"
+   ]
+  },
+  {
+   "id": "recorded/vllm/chat_completion_stream_f0c86d72-tool.json",
+   "chunks": [
+    "<|channel|>",
+    "analysis",
+    "<|message|>",
+    "User",
+    " asks",
+    " for",
+    " weather",
+    " in",
+    " San",
+    " Francisco",
+    " in",
+    " Celsius",
+    ".",
+    " Use",
+    " function",
+    ".",
+    "<|end|>",
+    "<|start|>",
+    "assistant",
+    "<|channel|>",
+    "comment",
+    "ary",
+    " to",
+    "=",
+    "functions",
+    ".get",
+    "_weather",
+    " ",
+    "<|constrain|>",
+    "json",
+    "<|message|>",
+    "{\"",
+    "location",
+    "\":\"",
+    "San",
+    " Francisco",
+    ",",
+    " CA",
+    "\",\"",
+    "unit",
+    "\":\"",
+    "c",
+    "elsius",
+    "\"}",
+    "<|call|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/tests/test_reasoning_parser.rs:382",
+   "chunks": [
+    "<|channel|>",
+    "analysis<|message|>Let me analyze this question carefully."
+   ]
+  },
+  {
+   "id": "literal/lib/llm/tests/test_reasoning_parser.rs:395",
+   "chunks": [
+    "<|end|><|start|>assistant<|channel|>final<|message|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/tests/test_reasoning_parser.rs:752",
+   "chunks": [
+    "<|channel|>analysis<|message|>Let me help you with that. I need to check the weather first.<|end|>",
+    "<|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"location\":\"San Francisco\"}",
+    "<|start|>assistant<|channel|>final<|message|>I'll check the weather for you."
+   ]
+  },
+  {
+   "id": "literal/lib/llm/tests/test_streaming_tool_parsers.rs:492",
+   "chunks": [
+    "<|channel|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/tests/test_streaming_tool_parsers.rs:523",
+   "chunks": [
+    "<|channel|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/tests/postprocessor_parsing_stream.rs:3408",
+   "chunks": [
+    "<|start|>assistant to=self<|message|>",
+    "<|eom|>",
+    "<|start|>assistant to=user<|message|>",
+    "<|eot|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/tests/postprocessor_parsing_stream.rs:3487",
+   "chunks": [
+    "{\"note\":\"<|start|>assistant to=self<|message|>literal<|eom|>\"}"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/tests/postprocessor_parsing_stream.rs:3763",
+   "chunks": [
+    "<|start|>assistant to=self<|message|>private<|eom|><|start|>assistant to=user<|message|>answer<|eot|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/tests/postprocessor_parsing_stream.rs:3948",
+   "chunks": [
+    "<|channel|>analysis<|message|>Need answer as JSON.<|end|><|start|>assistant<|channel|>final<|message|>{json}"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/tests/postprocessor_parsing_stream.rs:5222",
+   "chunks": [
+    "<|start|>assistant to=self<|message|>Look it up.<|eom|>",
+    "<|start|>assistant to=get_weather<|message|><atem:invoke name=\"get_weather\"><atem:parameter name=\"location\">Paris</atem:parameter></atem:invoke><|eom|>",
+    "<|start|>assistant to=user<|message|>It's 18C.<|eot|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/tests/postprocessor_parsing_stream.rs:5255",
+   "chunks": [
+    "<|start|>",
+    "<|message|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/tests/postprocessor_parsing_stream.rs:5622",
+   "chunks": [
+    "<|start|>",
+    "<|message|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/tests/tool_choice.rs:1088",
+   "chunks": [
+    "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"location\":\"Paris\"}<|call|>",
+    "<|channel|>commentary to=functions.search <|constrain|>json<|message|>{\"query\":\"Paris weather\"}<|call|>",
+    "<|channel|>commentary to=functions.my-tool.v2 <|constrain|>json<|message|>{\"location\":\"Paris\"}<|call|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/preprocessor.rs:6618",
+   "chunks": [
+    ")\n                })\n                .map(|parser| parser.preserve_special_tokens());\n        }\n        // Parsers in this allow-list match against special tokens that the\n        // tokenizer would otherwise strip when `skip_special_tokens=true`\n        // (the OpenAI-API default). Without the tokens preserved through\n        // decode the parsers silently produce empty reasoning_content /\n        // tool_calls.\n        //\n        // - gemma4: `<|think|>` prompt trigger plus parser-visible\n        //   `<|channel>` / `<channel|>` reasoning markers and tool-call markers.\n        // - harmony / gpt_oss: `<|channel|>analysis<|message|>...<|end|>`.\n        // - kimi_k2: `<|tool_calls_section_begin|>` / `<|tool_calls_section_end|>`.\n        // - kimi_k25: `</think>` (special token id 163607).\n        // - kimi_k3: `<|open|>` / `<|close|>` / `<|sep|>` XTML markers.\n        // - mistral: `[THINK]` / `[/THINK]` reasoning markers.\n        // - minimax_m3: `]<]minimax[>[` tool-call namespace tokens and\n        //   `<mm:think>` reasoning markers.\n        // - inkling: `<|message_model|>` / `<|content_thinking|>` /\n        //   `<|content_text|>` / `<|content_invoke_tool_json|>` / `<|end_message|>`\n        //   channel markers, consumed by both the tool-call and reasoning parsers.\n        // - muse_glimmer: `<|start|>` / `<|message|>` / `<|eom|>` / `<|eot|>`\n        //   channel markers, consumed by the unified parser (reasoning + content +\n        //   tool calls); matched on either parser name since the card may set only\n        //   the reasoning name.\n        Ok(matches!(\n            tool_call_parser,\n            Some("
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/preprocessor.rs:10076",
+   "chunks": [
+    "assistant to=self<|message|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/preprocessor.rs:10169",
+   "chunks": [
+    "assistant to=self<|message|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/preprocessor.rs:10205",
+   "chunks": [
+    "thought<|eom|><|start|>assistant to=user<|message|>{body}<|eot|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/preprocessor.rs:10702",
+   "chunks": [
+    "<|start|>assistant to=user<|message|>before<|eom|><|start|>assistant to=self<|message|>hidden<|eom|><|start|>assistant to=user<|message|>after<|eot|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/preprocessor.rs:11235",
+   "chunks": [
+    "<|call|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/preprocessor.rs:12718",
+   "chunks": [
+    "muse_glimmer tool-call only → required (`<|start|>` / `<|message|>` / `<|eom|>` / `<|eot|>` are special)"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/preprocessor.rs:12915",
+   "chunks": [
+    "...assistant to=self<|message|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/aggregator.rs:32",
+   "chunks": [
+    "<|channel|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/aggregator.rs:3399",
+   "chunks": [
+    "<|channel|>analysis<|message|>Need current weather.<|end|><|start|>assistant<|channel|>commentary to=functions.get_current_weather <|constrain|>json<|message|>{\"location\":\"Hidden City\"}"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/aggregator.rs:3429",
+   "chunks": [
+    "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"location\":\"Paris\"}<|call|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs:1600",
+   "chunks": [
+    "<|start|>assistant"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs:2340",
+   "chunks": [
+    "<|start|>assistant"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs:4016",
+   "chunks": [
+    " to=functions.get_weather<|channel|>analysis<|message|>{\"city\":\"Tokyo\"}<|call|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs:4021",
+   "chunks": [
+    "<|channel|>analysis<|message|>plan<|end|><|start|>assistant to=functions.get_weather<|channel|>commentary<|message|>{\"city\":\"Tokyo\"}<|call|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs:4031",
+   "chunks": [
+    "<|channel|>analysis<|message|>plan<|end|><|start|>assistant<|channel|>final<|message|>[{\"name\":\"get_weather\",\"parameters\":{\"city\":\"Tokyo\"}}]<|return|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs:4091",
+   "chunks": [
+    "<|channel|>analysis<|message|>thought<|end|><|start|>assistant<|channel|>final*)__Hello!"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs:8996",
+   "chunks": [
+    "<|open|>think<|sep|>",
+    "<|close|>think<|sep|>",
+    "<|start|>assistant to=self<|message|>",
+    "<|eom|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs:9990",
+   "chunks": [
+    "<|start|>assistant to=user<|message|>answer<|eot|>",
+    "<|open|>response<|sep|>answer<|close|>response<|sep|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs:10018",
+   "chunks": [
+    "<|start|>assistant to=self<|message|>",
+    "<|eom|>",
+    "<|open|>think<|sep|>",
+    "<|close|>think<|sep|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs:10068",
+   "chunks": [
+    "{key}:<|\"|>{raw}<|\"|>",
+    "<|tool_call>call:write_file{{{parameters}}}<tool_call|>",
+    "<|start|>assistant to=write_file<|message|><atem:invoke name=\"write_file\">{parameters}</atem:invoke><|eom|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs:10770",
+   "chunks": [
+    "literal \"<|message|>\" in a thought",
+    "{reasoning}<|eom|><|start|>assistant to=user<|message|>answer<|eot|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs:10836",
+   "chunks": [
+    "Hello. <|start|>assistant to=self<|message|>thinking<|eom|><|start|>assistant to=user<|message|>answer<|eot|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs:10909",
+   "chunks": [
+    "<|start|>assistant to=get_weather<|message|><atem:function_calls><atem:invoke name=\"get_weather\"><atem:parameter name=\"city\">Tokyo</atem:parameter></atem:invoke></atem:function_calls><|eom|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs:11037",
+   "chunks": [
+    "<|open|>think<|sep|>",
+    "<|close|>think<|sep|>",
+    "<|open|>response<|sep|>answer<|close|>response<|sep|>",
+    "<|start|>assistant to=self<|message|>",
+    "<|eom|>",
+    "<|start|>assistant to=user<|message|>answer<|eot|>"
+   ]
+  },
+  {
+   "id": "literal/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs:12034",
+   "chunks": [
+    "<|start|>assistant to=self<|message|>private<|eom|><|start|>assistant to=user<|message|>answer<|eot|>"
+   ]
+  }
+ ]
+}

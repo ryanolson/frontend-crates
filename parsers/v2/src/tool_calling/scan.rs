@@ -46,6 +46,7 @@
 //! a reasoning marker inside it is argument data, not a control token (`I7`).
 
 use std::collections::HashSet;
+use std::ops::Range;
 
 use crate::tool_calling::traits::{ToolCallDelta, ToolParseResult};
 use crate::unified::{
@@ -1980,6 +1981,63 @@ pub(crate) fn push_run<S: EventSink + ?Sized>(out: &mut S, kind: Kind, text: &st
     }
 }
 
+/// Append an input range, joining it to the last one when they touch. Empty
+/// text has no range, as it has no event.
+pub(crate) fn push_source(ranges: &mut Vec<Range<usize>>, range: Range<usize>) {
+    if range.is_empty() {
+        return;
+    }
+    match ranges.last_mut() {
+        Some(last) if last.end == range.start => last.end = range.end,
+        _ => ranges.push(range),
+    }
+}
+
+/// Input ranges behind committed text. Present only while recording, so the
+/// stock path keeps no range and allocates nothing for them.
+///
+/// The buffer only grows at the back and drains from the front, and committed
+/// text is always a buffer prefix. So `fed - buffer.len()` is the input offset of
+/// `buffer[0]` at every step, and no drain site has to count.
+#[derive(Debug, Default)]
+struct ScanSources {
+    /// Input bytes received since recording was turned on. Survives `reset`
+    /// and a new request.
+    fed: usize,
+    /// Ranges of committed text that `take_sources` has not moved out yet.
+    committed: Vec<Range<usize>>,
+}
+
+/// What [`WrappedBlockScanner::sources_mark`] saw: the count of committed ranges
+/// and the end of the last one. `None` when not recording.
+pub(crate) struct SourcesMark(Option<(usize, Option<usize>)>);
+
+/// Raw block bytes consumed before any call delta commits them, kept so that
+/// `reset` can return them. Spans need not touch in the input: text between two
+/// failed blocks is emitted, and `reset` returns the blocks joined. So while
+/// recording, each span keeps its input range here.
+#[derive(Debug, Default)]
+struct HeldBlock {
+    text: String,
+    /// Empty unless recording.
+    sources: Vec<Range<usize>>,
+}
+
+impl HeldBlock {
+    /// Hold `text`, which starts at input offset `start` (`None` when not recording).
+    fn push(&mut self, text: &str, start: Option<usize>) {
+        self.text.push_str(text);
+        if let Some(start) = start {
+            push_source(&mut self.sources, start..start + text.len());
+        }
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.sources.clear();
+    }
+}
+
 struct ToolSeparator {
     separator: &'static str,
     prefixed_openers: Vec<String>,
@@ -2006,7 +2064,9 @@ pub(crate) struct WrappedBlockScanner<E: InvokeEmitter> {
     prose: ProseControlState,
     tool_separator: Option<ToolSeparator>,
     /// Raw block bytes consumed before any call delta commits them.
-    uncommitted_block: String,
+    uncommitted_block: HeldBlock,
+    /// Input ranges of committed text, while recording.
+    sources: Option<ScanSources>,
     in_block: bool,
     in_reasoning: bool,
     accept_redundant_reasoning_start: bool,
@@ -2056,7 +2116,8 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
             buffer_previous: None,
             prose: ProseControlState::default(),
             tool_separator: None,
-            uncommitted_block: String::new(),
+            uncommitted_block: HeldBlock::default(),
+            sources: None,
             in_block: false,
             in_reasoning: false,
             accept_redundant_reasoning_start: false,
@@ -2283,6 +2344,9 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         out: &mut S,
     ) -> anyhow::Result<()> {
         self.buffer.push_str(chunk);
+        if let Some(sources) = &mut self.sources {
+            sources.fed += chunk.len();
+        }
         self.drain(false, out)
     }
 
@@ -2298,9 +2362,21 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
     }
 
     /// Clear one stream's scan state and return bytes not yet emitted.
+    ///
+    /// While recording, the returned text's ranges join the committed ones.
     pub(crate) fn reset(&mut self) -> String {
         self.finish_at_eos = false;
-        let mut pending = std::mem::take(&mut self.uncommitted_block);
+        let held = std::mem::take(&mut self.uncommitted_block);
+        if let Some(sources) = &mut self.sources {
+            for range in held.sources {
+                push_source(&mut sources.committed, range);
+            }
+            push_source(
+                &mut sources.committed,
+                sources.fed - self.buffer.len()..sources.fed,
+            );
+        }
+        let mut pending = held.text;
         pending.push_str(&std::mem::take(&mut self.buffer));
         self.buffer_previous = None;
         self.in_block = false;
@@ -2325,12 +2401,68 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         pending
     }
 
+    /// Record the input ranges of committed Text and Reasoning bytes from now on.
+    pub(crate) fn record_sources(&mut self) {
+        self.sources.get_or_insert_with(ScanSources::default);
+    }
+
+    /// Move the ranges committed since the last call into `out`, in output order.
+    pub(crate) fn take_sources(&mut self, out: &mut Vec<Range<usize>>) {
+        if let Some(sources) = &mut self.sources {
+            out.append(&mut sources.committed);
+        }
+    }
+
+    /// Where the committed ranges stand now, for [`Self::restore_sources`].
+    pub(crate) fn sources_mark(&self) -> SourcesMark {
+        SourcesMark(self.sources.as_ref().map(|sources| {
+            (
+                sources.committed.len(),
+                sources.committed.last().map(|range| range.end),
+            )
+        }))
+    }
+
+    /// Drop the ranges recorded since `mark`, for output that the caller drops.
+    /// A range recorded since then may have joined the last one, so that range
+    /// gets its old end back.
+    pub(crate) fn restore_sources(&mut self, mark: SourcesMark) {
+        if let (Some(sources), Some((len, end))) = (&mut self.sources, mark.0) {
+            sources.committed.truncate(len);
+            if let (Some(last), Some(end)) = (sources.committed.last_mut(), end) {
+                last.end = end;
+            }
+        }
+    }
+
+    /// The input offset of `buffer[at]`, while recording.
+    fn source_at(&self, at: usize) -> Option<usize> {
+        self.sources
+            .as_ref()
+            .map(|sources| sources.fed - self.buffer.len() + at)
+    }
+
+    /// Record `len` committed bytes that start at input offset `start`.
+    fn record(&mut self, start: Option<usize>, len: usize) {
+        if let (Some(sources), Some(start)) = (&mut self.sources, start) {
+            push_source(&mut sources.committed, start..start + len);
+        }
+    }
+
+    /// Push the first `len` buffer bytes as one run of `kind`, with their source.
+    fn emit_prefix<S: EventSink + ?Sized>(&mut self, out: &mut S, kind: Kind, len: usize) {
+        push_run(out, kind, &self.buffer[..len]);
+        let start = self.source_at(0);
+        self.record(start, len);
+    }
+
     fn consume_buffer_prefix(&mut self, bytes: usize) {
         if bytes == 0 {
             return;
         }
         if self.pending_parse_error.is_some() && self.in_block {
-            self.uncommitted_block.push_str(&self.buffer[..bytes]);
+            let start = self.source_at(0);
+            self.uncommitted_block.push(&self.buffer[..bytes], start);
         }
         self.buffer_previous = self.buffer[..bytes].chars().next_back();
         self.buffer.drain(..bytes);
@@ -2650,7 +2782,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                 InReasoning::ToolOpen => (0, false, true),
                 InReasoning::Stray(len) => (len, true, false),
             };
-            push_run(out, Kind::Reasoning, &self.buffer[..at]);
+            self.emit_prefix(out, Kind::Reasoning, at);
             self.prose
                 .consume_recovery(&self.buffer[..at], &self.spec.invoke_start);
             self.prose.clear();
@@ -2671,7 +2803,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         let keep = if flush { 0 } else { self.holdback_len() };
         let emit_len = self.buffer.len().saturating_sub(keep);
         if emit_len > 0 {
-            push_run(out, Kind::Reasoning, &self.buffer[..emit_len]);
+            self.emit_prefix(out, Kind::Reasoning, emit_len);
             self.prose
                 .consume_recovery(&self.buffer[..emit_len], &self.spec.invoke_start);
             self.consume_buffer_prefix(emit_len);
@@ -2750,9 +2882,11 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                 ProseControl::Ordinary => (0, false, false),
             };
             if length > 0 {
+                let start = self.source_at(0);
                 let prose: String = self.buffer.drain(..length).collect();
                 self.prose.consume(&prose);
                 push_run(out, kind, &prose);
+                self.record(start, prose.len());
                 if channel.is_none() {
                     self.header_slot = false;
                 }
@@ -2796,7 +2930,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
             !(channel.json_body && self.env_json.inside_string_at(&self.buffer, *at))
         });
         if let Some((at, marker)) = found {
-            push_run(out, kind, &self.buffer[..at]);
+            self.emit_prefix(out, kind, at);
             self.env_json.reset();
             let consumed = at + envelope_close_len(env, marker);
             self.buffer.drain(..consumed);
@@ -2813,7 +2947,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         };
         let emit = self.buffer.len() - keep;
         if emit > 0 {
-            push_run(out, kind, &self.buffer[..emit]);
+            self.emit_prefix(out, kind, emit);
             self.env_json.advance(&self.buffer[..emit]);
             self.prose.consume(&self.buffer[..emit]);
             self.buffer.drain(..emit);
@@ -3008,7 +3142,9 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                 };
                 match recipient {
                     Some(name) => {
-                        self.uncommitted_block = self.buffer[..consume].to_string();
+                        let start = self.source_at(0);
+                        self.uncommitted_block.clear();
+                        self.uncommitted_block.push(&self.buffer[..consume], start);
                         // A family may frame THIS recipient's body from its schema; the
                         // factory boundary stays in place otherwise.
                         if let Some(mut boundary) = self.emitter.channel_boundary(&name) {
@@ -3134,7 +3270,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         let prose =
             self.envelope.is_none_or(|env| env.prose_between_messages) || !self.reasoning_enabled;
         if prose {
-            out.push_text(&self.buffer[..n]);
+            self.emit_prefix(out, Kind::Text, n);
             self.prose.consume(&self.buffer[..n]);
         } else {
             tracing::debug!(
@@ -3279,6 +3415,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                     ProseControl::Ordinary => (0, false, false),
                 };
                 if length > 0 {
+                    let start = self.source_at(0);
                     let prose = self.buffer[..length].to_owned();
                     self.consume_buffer_prefix(length);
                     self.prose.consume(&prose);
@@ -3292,6 +3429,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                             },
                             &prose,
                         );
+                        self.record(start, prose.len());
                     }
                 }
                 if waiting {
@@ -3353,7 +3491,8 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                 };
                 if start > 0 {
                     if self.pending_parse_error.is_none() {
-                        self.uncommitted_block.push_str(&self.buffer[..start]);
+                        let source = self.source_at(0);
+                        self.uncommitted_block.push(&self.buffer[..start], source);
                     }
                     self.consume_buffer_prefix(start);
                     self.reset_invoke_boundary();
@@ -3466,6 +3605,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                     continue;
                 }
                 let invoke = self.buffer[..end].to_string();
+                let invoke_source = self.source_at(0);
                 // Emit BEFORE consuming. `parse_invoke` is fallible, and draining first
                 // meant a failing emitter destroyed the invoke bytes: they were gone from
                 // the buffer, so `reset` could no longer hand them back and the
@@ -3485,7 +3625,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                     }
                 } else {
                     if self.pending_parse_error.is_none() {
-                        self.uncommitted_block.push_str(&invoke);
+                        self.uncommitted_block.push(&invoke, invoke_source);
                     }
                 }
                 if self.spec.invoke_latch == InvokeLatch::Always {
@@ -3517,7 +3657,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                     .min();
                 if next_open.is_none_or(|open| pos < open) {
                     if !self.suppress_normal_text && pos > 0 {
-                        push_run(out, Kind::Text, &self.buffer[..pos]);
+                        self.emit_prefix(out, Kind::Text, pos);
                     }
                     self.prose
                         .consume_recovery(&self.buffer[..pos], &self.spec.invoke_start);
@@ -3546,7 +3686,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                 let emit_len = self.buffer.len().saturating_sub(keep);
                 if emit_len > 0 {
                     if !self.suppress_normal_text {
-                        push_run(out, Kind::Text, &self.buffer[..emit_len]);
+                        self.emit_prefix(out, Kind::Text, emit_len);
                     }
                     self.prose
                         .consume_recovery(&self.buffer[..emit_len], &self.spec.invoke_start);
@@ -3558,10 +3698,11 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
             if start > 0 {
                 let emit_len = start - self.tool_separator_len_at(start);
                 if !self.suppress_normal_text {
-                    push_run(out, Kind::Text, &self.buffer[..emit_len]);
+                    self.emit_prefix(out, Kind::Text, emit_len);
                 }
+                let separator = self.source_at(emit_len);
                 self.uncommitted_block
-                    .push_str(&self.buffer[emit_len..start]);
+                    .push(&self.buffer[emit_len..start], separator);
                 self.prose
                     .consume_recovery(&self.buffer[..start], &self.spec.invoke_start);
                 self.consume_buffer_prefix(start);
@@ -3570,7 +3711,8 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
             self.prose.clear();
             match marker {
                 Marker::Block(blen) => {
-                    self.uncommitted_block.push_str(&self.buffer[..blen]);
+                    let start = self.source_at(0);
+                    self.uncommitted_block.push(&self.buffer[..blen], start);
                     self.consume_buffer_prefix(blen);
                     self.reset_invoke_boundary();
                     self.in_block = true;
@@ -3617,6 +3759,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                         break;
                     };
                     let invoke = self.buffer[..end].to_string();
+                    let invoke_source = self.source_at(0);
                     // Emit before consuming — same recovery contract as the wrapped site.
                     let emitted = self.parse_complete_invoke(&invoke, self.next_index)?;
                     self.consume_buffer_prefix(end);
@@ -3636,7 +3779,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                         self.suppress_normal_text =
                             self.spec.bare_recovery_latch == BareRecoveryLatch::Set;
                     } else if self.pending_parse_error.is_some() {
-                        self.uncommitted_block.push_str(&invoke);
+                        self.uncommitted_block.push(&invoke, invoke_source);
                     }
                     // A bare invoke nested in a thought has no block close to
                     // resume on, so resume here.

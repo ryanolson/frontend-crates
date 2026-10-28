@@ -13,6 +13,7 @@
 
 pub mod known_toolcalling_chunking;
 pub mod known_unified_divergences;
+pub mod source_ranges;
 pub mod unified_capture;
 
 use std::collections::BTreeMap;
