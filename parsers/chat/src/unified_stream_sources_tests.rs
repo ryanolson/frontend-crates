@@ -856,8 +856,9 @@ fn the_corpus_records_without_changing_a_chunk() {
 }
 
 /// The same with the real parsers. Some refuse to record by design: Kimi K3
-/// and Muse Glimmer always, and Gemma 4 when the prompt prefix ends inside the
-/// `thought` label, because those held prompt bytes can surface as output.
+/// and Muse Glimmer always, and Gemma 4 when the prompt prefix is shorter than
+/// the whole `<|channel>thought\n` header, because those held prompt bytes can
+/// surface as output.
 /// Each must refuse when the stream starts, before any output. Tool-call ids
 /// are random, so they are compared by shape.
 #[test]
@@ -877,11 +878,9 @@ fn the_corpus_records_with_the_real_parsers() {
         let name = case["name"].as_str().unwrap();
         let (slotted, texts) = with_slots(&input);
         let output = request.run(slotted);
-        let partial_label = name
-            .strip_prefix("gemma_prefix/")
-            .and_then(|rest| rest.split('/').next())
-            .is_some_and(|end| end != "<|channel>".len().to_string());
-        if partial_label || matches!(case["family"].as_str(), Some("kimi_k3" | "muse_glimmer")) {
+        // Every corpus prefix is shorter than the whole header.
+        let held_prefix = name.starts_with("gemma_prefix/");
+        if held_prefix || matches!(case["family"].as_str(), Some("kimi_k3" | "muse_glimmer")) {
             let delta_text = output
                 .iter()
                 .filter_map(|item| item.data.as_ref())
@@ -907,7 +906,7 @@ fn the_corpus_records_with_the_real_parsers() {
                 "{name}: expected a refusal"
             );
             refused += 1;
-            gemma_refused += usize::from(partial_label);
+            gemma_refused += usize::from(held_prefix);
             continue;
         }
         let expected: Vec<_> = request
@@ -927,9 +926,9 @@ fn the_corpus_records_with_the_real_parsers() {
     }
     assert!(checked > 900, "{checked} cases checked");
     assert!(refused > 200, "{refused} cases refused");
-    // Prefix ends 11 to 17, each with two outputs.
+    // Prefix ends 10 to 17, each with two outputs.
     assert_eq!(
-        gemma_refused, 14,
+        gemma_refused, 16,
         "{gemma_refused} Gemma prefix cases refused"
     );
 }
@@ -1451,5 +1450,41 @@ fn disabling_sources_before_usage_flush_refuses_undated_held_text() {
                         .iter()
                         .all(|choice| text_len(choice.delta.content.as_ref()) == 0)
             })
+    );
+}
+
+#[test]
+fn the_adapter_source_checker_rejects_a_range_inside_the_opener() {
+    let case = corpus()
+        .into_iter()
+        .find(|case| case["name"] == "core/qwen3/reason_text/split4/none")
+        .unwrap();
+    let input: Vec<Plain> = case["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(corpus_item)
+        .collect();
+    let (slotted, texts) = with_slots(&input);
+    let mut output = corpus_request(&case).run(slotted);
+    check_sources(&output, &texts).unwrap();
+    assert_eq!(&texts[&0], "<think>Think it over.</think>Answer here.");
+    assert_eq!(&texts[&0][2..6], "hink");
+    assert_eq!(&texts[&0][8..12], "hink");
+    let mut changed = 0;
+    for data in output.iter_mut().filter_map(|item| item.data.as_mut()) {
+        for entry in &mut data.slot {
+            for range in &mut entry.reasoning {
+                if *range == (8..12) {
+                    *range = 2..6;
+                    changed += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(changed, 1);
+    assert!(
+        check_sources(&output, &texts).is_err(),
+        "a range inside the stripped <think> opener cannot source reasoning text"
     );
 }

@@ -231,8 +231,11 @@ fn read(text: &str, ranges: &[Range<usize>]) -> Option<String> {
         .map(|parts| parts.concat())
 }
 
+/// Each choice's ranges read back its text, each channel's ranges move forward
+/// through the input, and no input byte is dated twice.
 fn check(output: &[SourcedChunk], texts: &HashMap<u32, String>) -> Result<(), String> {
     let mut used: HashMap<u32, Vec<Range<usize>>> = HashMap::new();
+    let mut channel_end: HashMap<(u32, &str), usize> = HashMap::new();
     for (position, item) in output.iter().enumerate() {
         let Some(data) = &item.chunk.data else {
             continue;
@@ -258,6 +261,15 @@ fn check(output: &[SourcedChunk], texts: &HashMap<u32, String>) -> Result<(), St
                         "item {position}: {field} {expected:?} has ranges {ranges:?} over {text:?}"
                     ));
                 }
+                let end = channel_end.entry((choice.index, field)).or_default();
+                for range in ranges {
+                    if range.start < *end {
+                        return Err(format!(
+                            "item {position}: {field} range {range:?} starts before {end}"
+                        ));
+                    }
+                    *end = range.end;
+                }
                 used.entry(choice.index)
                     .or_default()
                     .extend(ranges.iter().cloned());
@@ -276,12 +288,13 @@ fn check(output: &[SourcedChunk], texts: &HashMap<u32, String>) -> Result<(), St
 }
 
 /// Whether this case refuses to record by design: Kimi K3 and Muse Glimmer
-/// always, and Gemma 4 when the prompt prefix ends inside the `thought` label.
+/// always, and Gemma 4 when the prompt prefix is shorter than the whole
+/// `<|channel>thought\n` header, because the parser holds those prompt bytes.
 fn refuses_by_design(case: &Value) -> bool {
-    let partial_label = case["prefix"]
+    let held_prefix = case["prefix"]
         .as_str()
-        .is_some_and(|prefix| prefix.len() > "<|channel>".len());
-    matches!(case["family"].as_str(), Some("kimi_k3" | "muse_glimmer")) || partial_label
+        .is_some_and(|prefix| prefix.len() < "<|channel>thought\n".len());
+    matches!(case["family"].as_str(), Some("kimi_k3" | "muse_glimmer")) || held_prefix
 }
 
 /// A chunk list as JSON, with each generated tool-call id written as `call-*`.
@@ -368,4 +381,82 @@ async fn the_corpus_records_through_the_policies() {
     );
     assert!(checked > 3600, "{checked} runs checked");
     assert!(refused > 0, "{refused} runs refused");
+}
+
+async fn split_reasoning_case() -> (Vec<SourcedChunk>, HashMap<u32, String>) {
+    let case = corpus()
+        .into_iter()
+        .find(|case| case["name"] == "core/qwen3/reason_text/split4/none")
+        .unwrap();
+    let (_, texts) = input(&case, true);
+    let recorded = run(&case, true, false, false).await;
+    check(&recorded, &texts).unwrap();
+    (recorded, texts)
+}
+
+fn move_reasoning_source(output: &mut [SourcedChunk], from: Range<usize>, to: Range<usize>) {
+    let mut changed = 0;
+    for item in output {
+        for entry in item.sources.iter_mut().flatten() {
+            for range in &mut entry.reasoning {
+                if *range == from {
+                    *range = to.clone();
+                    changed += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(changed, 1);
+}
+
+#[tokio::test]
+async fn the_policy_source_checker_rejects_other_bytes() {
+    let (mut output, texts) = split_reasoning_case().await;
+    move_reasoning_source(&mut output, 8..12, 0..4);
+    assert!(check(&output, &texts).is_err());
+}
+
+#[tokio::test]
+async fn the_policy_source_checker_rejects_a_range_inside_the_opener() {
+    let (mut output, texts) = split_reasoning_case().await;
+    assert_eq!(&texts[&0], "<think>Think it over.</think>Answer here.");
+    assert_eq!(&texts[&0][2..6], "hink");
+    assert_eq!(&texts[&0][8..12], "hink");
+    move_reasoning_source(&mut output, 8..12, 2..6);
+    assert!(
+        check(&output, &texts).is_err(),
+        "a range inside the stripped <think> opener cannot source reasoning text"
+    );
+}
+
+#[test]
+fn partial_gemma_labels_are_design_refusals() {
+    assert!(!refuses_by_design(&json!({
+        "family": "gemma4", "prefix": "<|channel>thought\n"
+    })));
+    for prefix in ["<|channel>", "<|channel>t", "<|channel>thought"] {
+        assert!(refuses_by_design(&json!({
+            "family": "gemma4", "prefix": prefix
+        })));
+    }
+}
+
+#[tokio::test]
+async fn a_complete_gemma_header_is_not_a_design_refusal() {
+    let mut case = corpus()
+        .into_iter()
+        .find(|case| case["name"] == "gemma_prefix/10/answer")
+        .unwrap();
+    case["name"] = json!("gemma_prefix/18/answer");
+    case["prefix"] = json!("<|channel>thought\n");
+    let (_, texts) = input(&case, true);
+    let stock = run(&case, false, false, false).await;
+    let recorded = run(&case, true, false, false).await;
+    assert!(recorded.iter().all(|item| item.chunk.error.is_none()));
+    assert_eq!(id_shape(&recorded), id_shape(&stock));
+    check(&recorded, &texts).unwrap();
+    assert!(
+        !refuses_by_design(&case),
+        "the complete header records successfully and holds no prompt label bytes"
+    );
 }
