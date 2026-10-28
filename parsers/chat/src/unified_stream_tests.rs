@@ -6257,3 +6257,19 @@ fn public_marker_helpers_skip_quoted_markers() {
 #[path = "unified_stream_sources_tests.rs"]
 #[allow(clippy::single_range_in_vec_init)]
 mod sources;
+
+#[test]
+#[ignore = "F1: inline event spans grow Deltas from 48 to 56 bytes even without recording"]
+fn f1_recording_off_deltas_keep_their_size() {
+    let deltas = Deltas::new(false);
+    assert!(deltas.spans.is_none());
+    let before = std::mem::size_of::<(
+        Vec<UnifiedParserEvent>,
+        Option<Vec<Vec<std::ops::Range<usize>>>>,
+    )>();
+    let actual = std::mem::size_of_val(&deltas);
+    assert!(
+        actual <= before,
+        "recording-off Deltas is {actual} bytes; bound {before}"
+    );
+}
