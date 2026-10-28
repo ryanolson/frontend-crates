@@ -192,6 +192,9 @@ impl UnifiedStreamItem for Item {
 }
 
 /// dynamo's `scrub_synthetic_chunk_metadata`.
+// This item carries no source slot: the defaults record nothing.
+impl dynamo_parsers::sources::SourceSlot for Item {}
+
 impl ChatStreamItem for Item {
     fn is_error(&self) -> bool {
         self.event.as_deref() == Some("error")

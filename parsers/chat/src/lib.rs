@@ -50,6 +50,10 @@ mod spans;
 pub mod special_tokens;
 pub mod stop_tokens;
 pub mod stream_item;
+#[cfg(test)]
+mod stream_policies_cost_tests;
+#[cfg(test)]
+mod stream_policies_sources_tests;
 pub mod tool_call_policy;
 pub mod tools;
 pub mod unified_stream;

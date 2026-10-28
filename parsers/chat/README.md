@@ -21,8 +21,8 @@ The rules an OpenAI chat frontend uses to pick and drive Dynamo's parsers. The p
 | `stream_item` | The stream item that `unified_stream` reads. Dynamo implements it for its own item, so its per-chunk fields (`nvext`, metrics, completion evidence) stay in place. A chunk with a `SourceSlot` (from `dynamo-parsers`) also gets, for each choice, the input byte ranges its text came from. |
 | `guided` | `GuidedToolConstraint`: the tool-output grammar a request installed. |
 | `chat_stream` | `parse_chat_stream`: the parse stage of a chat stream. It picks the stages for a request (the v2 adapter, or dynamo-parsers' v1 reasoning stream and the caller's v1 jail) and chains the stream policies after them. |
-| `reasoning_off` | Whether a request turned reasoning off, and the fold of reasoning into content when it did. |
-| `nonempty_content` | The `force_nonempty_content` contract on a stream, and whether a stream can hold back all output (the keep-alive predicate). |
+| `reasoning_off` | Whether a request turned reasoning off, and the fold of reasoning into content when it did. On items with a source slot, the reasoning ranges move with the folded text. |
+| `nonempty_content` | The `force_nonempty_content` contract on a stream, and whether a stream can hold back all output (the keep-alive predicate). On items with a source slot, held text keeps its ranges wherever it is released. |
 | `tool_call_policy` | The request's tool-call policy on parsed output, and the assistant role on each choice's first delta. |
 | `reasoning_usage` | The `reasoning_tokens` estimate in the usage chunk. |
 
