@@ -437,3 +437,69 @@ async fn review_f1_fold_dates_each_duplicate_choice_entry() {
         assert!(entry.reasoning.is_empty());
     }
 }
+
+#[tokio::test]
+#[ignore = "F5: a contentless duplicate consumes the following choice's source entry"]
+async fn review_f5_contentless_duplicate_does_not_steal_policy_sources() {
+    let mut violations = Vec::new();
+    for (name, policy) in [("fold", fold as Policy), ("defer", defer as Policy)] {
+        let chunks = vec![chunk(vec![
+            json!({"index": 0, "delta": {"role": "assistant"}}),
+            json!({"index": 0, "delta": {"reasoning_content": "R", "content": "A"}}),
+        ])];
+        let mut complete = with_sources(&chunks);
+        let control: Vec<_> = policy(stream::iter(complete.clone()).boxed())
+            .collect()
+            .await;
+        let totals = |items: &[SourcedChunk]| {
+            let mut text_bytes = (0, 0);
+            let mut source_bytes = (0, 0);
+            for item in items {
+                for choice in &item.chunk().unwrap().choices {
+                    text_bytes.0 += text_of(&choice.delta.content).len();
+                    text_bytes.1 += choice
+                        .delta
+                        .reasoning_content
+                        .as_ref()
+                        .map_or(0, String::len);
+                }
+                for entry in item.sources().unwrap() {
+                    source_bytes.0 += entry.content.iter().map(|range| range.len()).sum::<usize>();
+                    source_bytes.1 += entry
+                        .reasoning
+                        .iter()
+                        .map(|range| range.len())
+                        .sum::<usize>();
+                }
+            }
+            (text_bytes, source_bytes)
+        };
+        let (text_bytes, source_bytes) = totals(&control);
+        assert_eq!(
+            text_bytes, source_bytes,
+            "{name}: complete entries are the control"
+        );
+
+        // A choice with no text needs no entry. The only entry belongs to RA.
+        complete[0].sources.as_mut().unwrap().remove(0);
+        let output: Vec<_> = policy(stream::iter(complete).boxed()).collect().await;
+        assert_eq!(
+            control
+                .iter()
+                .map(|item| serde_json::to_value(&item.chunk).unwrap())
+                .collect::<Vec<_>>(),
+            output
+                .iter()
+                .map(|item| serde_json::to_value(&item.chunk).unwrap())
+                .collect::<Vec<_>>(),
+        );
+        let (text_bytes, source_bytes) = totals(&output);
+        if text_bytes != source_bytes {
+            violations.push((name, text_bytes, source_bytes));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "contentless duplicates break tiling (policy, text bytes, source bytes): {violations:?}"
+    );
+}
