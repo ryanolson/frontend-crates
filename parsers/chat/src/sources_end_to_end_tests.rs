@@ -369,3 +369,50 @@ async fn the_corpus_records_through_the_policies() {
     assert!(checked > 3600, "{checked} runs checked");
     assert!(refused > 0, "{refused} runs refused");
 }
+
+async fn split_reasoning_case() -> (Vec<SourcedChunk>, HashMap<u32, String>) {
+    let case = corpus()
+        .into_iter()
+        .find(|case| case["name"] == "core/qwen3/reason_text/split4/none")
+        .unwrap();
+    let (_, texts) = input(&case, true);
+    let recorded = run(&case, true, false, false).await;
+    check(&recorded, &texts).unwrap();
+    (recorded, texts)
+}
+
+fn move_reasoning_source(output: &mut [SourcedChunk], from: Range<usize>, to: Range<usize>) {
+    let mut changed = 0;
+    for item in output {
+        for entry in item.sources.iter_mut().flatten() {
+            for range in &mut entry.reasoning {
+                if *range == from {
+                    *range = to.clone();
+                    changed += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(changed, 1);
+}
+
+#[tokio::test]
+async fn the_policy_source_checker_rejects_other_bytes() {
+    let (mut output, texts) = split_reasoning_case().await;
+    move_reasoning_source(&mut output, 8..12, 0..4);
+    assert!(check(&output, &texts).is_err());
+}
+
+#[tokio::test]
+#[ignore = "F3: the checker accepts a reasoning range moved into stripped markup"]
+async fn the_policy_source_checker_rejects_a_range_inside_the_opener() {
+    let (mut output, texts) = split_reasoning_case().await;
+    assert_eq!(&texts[&0], "<think>Think it over.</think>Answer here.");
+    assert_eq!(&texts[&0][2..6], "hink");
+    assert_eq!(&texts[&0][8..12], "hink");
+    move_reasoning_source(&mut output, 8..12, 2..6);
+    assert!(
+        check(&output, &texts).is_err(),
+        "a range inside the stripped <think> opener cannot source reasoning text"
+    );
+}

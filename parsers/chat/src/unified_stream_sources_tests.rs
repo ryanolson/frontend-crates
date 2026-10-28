@@ -1417,3 +1417,40 @@ fn disabling_sources_before_usage_flush_refuses_undated_held_text() {
             })
     );
 }
+
+#[test]
+#[ignore = "F3: the checker accepts a reasoning range moved into stripped markup"]
+fn the_adapter_source_checker_rejects_a_range_inside_the_opener() {
+    let case = corpus()
+        .into_iter()
+        .find(|case| case["name"] == "core/qwen3/reason_text/split4/none")
+        .unwrap();
+    let input: Vec<Plain> = case["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(corpus_item)
+        .collect();
+    let (slotted, texts) = with_slots(&input);
+    let mut output = corpus_request(&case).run(slotted);
+    check_sources(&output, &texts).unwrap();
+    assert_eq!(&texts[&0], "<think>Think it over.</think>Answer here.");
+    assert_eq!(&texts[&0][2..6], "hink");
+    assert_eq!(&texts[&0][8..12], "hink");
+    let mut changed = 0;
+    for data in output.iter_mut().filter_map(|item| item.data.as_mut()) {
+        for entry in &mut data.slot {
+            for range in &mut entry.reasoning {
+                if *range == (8..12) {
+                    *range = 2..6;
+                    changed += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(changed, 1);
+    assert!(
+        check_sources(&output, &texts).is_err(),
+        "a range inside the stripped <think> opener cannot source reasoning text"
+    );
+}
