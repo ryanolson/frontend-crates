@@ -66,12 +66,14 @@ use crate::tool_calling::parsers::{
 };
 
 #[cfg(test)]
+mod future_size_tests;
+#[cfg(test)]
 mod sources_tests;
 
 /// Drops the source entries of choices whose text arrived without ranges.
-fn drop_unsourced(unsourced: &HashSet<u32>, item: &mut SourcedItem) {
+fn drop_unsourced<I: JailItem>(unsourced: &HashSet<u32>, item: &mut I) {
     if !unsourced.is_empty()
-        && let Some(sources) = item.1.as_mut()
+        && let Some(sources) = item.sources_mut()
     {
         sources.retain(|entry| !unsourced.contains(&entry.index));
     }
@@ -84,6 +86,82 @@ pub(crate) type SourcedItem = (
     Annotated<CreateChatCompletionStreamResponse>,
     Option<Vec<ChoiceSources>>,
 );
+
+/// An item type the jail streams: the stock chunk, or a [`SourcedItem`].
+///
+/// The jail loop is generic over it so that the stock `apply` streams its
+/// chunks as they are. Wrapping each chunk in a `(chunk, None)` pair and back
+/// cost the stock path about 2% more instructions per chunk, mostly copies of
+/// the chunk. `RECORDS` is false for the stock chunk, so its copy of the loop
+/// compiles the recording branches out.
+pub(crate) trait JailItem: Send + 'static {
+    /// Whether this item type can carry sources.
+    const RECORDS: bool;
+
+    fn into_parts(self) -> SourcedItem;
+
+    fn from_parts(item: SourcedItem) -> Self;
+
+    /// The item's sources, `None` when it carries none.
+    fn sources_mut(&mut self) -> Option<&mut Vec<ChoiceSources>>;
+}
+
+impl JailItem for Annotated<CreateChatCompletionStreamResponse> {
+    const RECORDS: bool = false;
+
+    #[inline]
+    fn into_parts(self) -> SourcedItem {
+        (self, None)
+    }
+
+    #[inline]
+    fn from_parts((chunk, _): SourcedItem) -> Self {
+        chunk
+    }
+
+    #[inline]
+    fn sources_mut(&mut self) -> Option<&mut Vec<ChoiceSources>> {
+        None
+    }
+}
+
+impl JailItem for SourcedItem {
+    const RECORDS: bool = true;
+
+    #[inline]
+    fn into_parts(self) -> SourcedItem {
+        self
+    }
+
+    #[inline]
+    fn from_parts(item: SourcedItem) -> Self {
+        item
+    }
+
+    #[inline]
+    fn sources_mut(&mut self) -> Option<&mut Vec<ChoiceSources>> {
+        self.1.as_mut()
+    }
+}
+
+impl JailItem for SourcedChunk {
+    const RECORDS: bool = true;
+
+    #[inline]
+    fn into_parts(self) -> SourcedItem {
+        (self.chunk, self.sources)
+    }
+
+    #[inline]
+    fn from_parts((chunk, sources): SourcedItem) -> Self {
+        SourcedChunk { chunk, sources }
+    }
+
+    #[inline]
+    fn sources_mut(&mut self) -> Option<&mut Vec<ChoiceSources>> {
+        self.sources.as_mut()
+    }
+}
 
 fn is_harmony_parser(parser: Option<&str>) -> bool {
     parser == Some("harmony")
@@ -917,6 +995,7 @@ impl ChoiceJailState {
     }
 
     /// The sources of an input text: the caller's, or this choice's own offsets.
+    #[inline]
     fn input_spans(
         &mut self,
         text: &str,
@@ -2131,9 +2210,8 @@ impl JailedStream {
         S: Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send + 'static,
     {
         let jail_mode = self.jail_mode.clone();
-        let jailed_stream = self.apply_pairs(false, stream.map(|response| (response, None)));
+        let jailed_stream = self.apply_pairs(false, stream);
         JailedStream::fix_finish_reason(jailed_stream, jail_mode, false)
-            .map(|(response, _)| response)
     }
 
     /// [`apply_with_finish_reason`](Self::apply_with_finish_reason), carrying
@@ -2149,9 +2227,8 @@ impl JailedStream {
         let jail_mode = self.jail_mode.clone();
         let record = self.can_record_sources();
         self.caller_ranges = true;
-        let jailed_stream = self.apply_pairs(record, stream.map(|item| (item.chunk, item.sources)));
+        let jailed_stream = self.apply_pairs(record, stream);
         JailedStream::fix_finish_reason(jailed_stream, jail_mode, record)
-            .map(|(chunk, sources)| SourcedChunk { chunk, sources })
     }
 
     /// Apply the jail transformation to a stream of chat completion responses
@@ -2163,8 +2240,7 @@ impl JailedStream {
     where
         S: Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send + 'static,
     {
-        self.apply_pairs(false, stream.map(|response| (response, None)))
-            .map(|(response, _)| response)
+        self.apply_pairs(false, stream)
     }
 
     /// [`apply`](Self::apply), carrying the input ranges of each choice's text.
@@ -2184,8 +2260,7 @@ impl JailedStream {
     {
         let record = self.can_record_sources();
         self.caller_ranges = true;
-        self.apply_pairs(record, stream.map(|item| (item.chunk, item.sources)))
-            .map(|(chunk, sources)| SourcedChunk { chunk, sources })
+        self.apply_pairs(record, stream)
     }
 
     /// Whether [`apply_sourced`](Self::apply_sourced) can record sources for
@@ -2204,15 +2279,16 @@ impl JailedStream {
     /// [`apply_sourced`](Self::apply_sourced). Inside the crate, when the caller
     /// gives no ranges (`caller_ranges` unset), a choice's offsets count the
     /// text it received, apart for content and for reasoning.
-    pub(crate) fn apply_pairs<S>(
+    pub(crate) fn apply_pairs<I, S>(
         mut self,
         record: bool,
         stream: S,
-    ) -> impl Stream<Item = SourcedItem> + Send
+    ) -> impl Stream<Item = I> + Send
     where
-        S: Stream<Item = SourcedItem> + Send + 'static,
+        I: JailItem,
+        S: Stream<Item = I> + Send + 'static,
     {
-        self.recording = record && self.can_record_sources();
+        self.recording = I::RECORDS && record && self.can_record_sources();
         let recording = self.recording;
         let caller_ranges = self.caller_ranges;
         let separates_k3_reasoning = is_kimi_k3_parser(self.tool_call_parser.as_deref());
@@ -2236,7 +2312,8 @@ impl JailedStream {
 
 
             // Process each item in the stream
-            while let Some((response, input_sources)) = stream.next().await {
+            while let Some(item) = stream.next().await {
+                let (response, input_sources) = item.into_parts();
                 // Each choice's entry, paired by `match_choice_sources`.
                 let matched: Vec<Option<ChoiceSources>> = match (input_sources, response.data.as_ref()) {
                     (Some(entries), Some(data)) if recording => {
@@ -2254,7 +2331,7 @@ impl JailedStream {
                     if chat_response.choices.is_empty() {
                         // No choices processed (e.g., usage-only chunk)
                         // Pass through as-is to preserve usage and other metadata
-                        yield (response, recording.then(Vec::new));
+                        yield I::from_parts((response, recording.then(Vec::new)));
                         continue;
                     }
 
@@ -2468,7 +2545,7 @@ impl JailedStream {
                         // Emit pass-through prefixes before parsed tool calls.
                         if !passthrough_emissions.is_empty() {
                             let current_metadata = (response.id.clone(), response.event.clone(), response.comment.clone());
-                            let responses = self.emit_choice_emissions(passthrough_emissions, chat_response, current_metadata);
+                            let responses: Vec<I> = self.emit_choice_emissions(passthrough_emissions, chat_response, current_metadata);
                             for mut emitted_response in responses {
                                 drop_unsourced(&unsourced, &mut emitted_response);
                                 yield emitted_response;
@@ -2482,7 +2559,7 @@ impl JailedStream {
                                 last_annotated_event.clone(),
                                 last_annotated_comment.clone(),
                             );
-                            let responses = self.emit_choice_emissions(tool_content_emissions, chat_response, preserved_metadata);
+                            let responses: Vec<I> = self.emit_choice_emissions(tool_content_emissions, chat_response, preserved_metadata);
                             for mut emitted_response in responses {
                                 drop_unsourced(&unsourced, &mut emitted_response);
                                 yield emitted_response;
@@ -2496,7 +2573,7 @@ impl JailedStream {
                                 last_annotated_event.clone(),
                                 last_annotated_comment.clone(),
                             );
-                            let responses = self.emit_choice_emissions(trailing_emissions, chat_response, preserved_metadata);
+                            let responses: Vec<I> = self.emit_choice_emissions(trailing_emissions, chat_response, preserved_metadata);
                             for mut emitted_response in responses {
                                 drop_unsourced(&unsourced, &mut emitted_response);
                                 yield emitted_response;
@@ -2505,7 +2582,7 @@ impl JailedStream {
                     }
                 } else {
                     // No response data, pass through as-is
-                    yield (response, recording.then(Vec::new));
+                    yield I::from_parts((response, recording.then(Vec::new)));
                 }
             }
 
@@ -2535,7 +2612,7 @@ impl JailedStream {
                 };
 
                 let final_metadata = (last_annotated_id, last_annotated_event, last_annotated_comment);
-                let responses = self.emit_choice_emissions(final_emissions, &dummy_response, final_metadata);
+                let responses: Vec<I> = self.emit_choice_emissions(final_emissions, &dummy_response, final_metadata);
                 for mut emitted_response in responses {
                     drop_unsourced(&unsourced, &mut emitted_response);
                     yield emitted_response;
@@ -2545,12 +2622,14 @@ impl JailedStream {
     }
 
     /// Emit choice emissions based on the configured emission mode
-    fn emit_choice_emissions(
+    /// Builds the output items of `emissions`. Generic over the item type so
+    /// the stock path builds its chunks directly, with no pair to unpack.
+    fn emit_choice_emissions<I: JailItem>(
         &self,
         emissions: Vec<Emitted>,
         base_response: &CreateChatCompletionStreamResponse,
         annotated_metadata: (Option<String>, Option<String>, Option<Vec<String>>),
-    ) -> Vec<SourcedItem> {
+    ) -> Vec<I> {
         if emissions.is_empty() {
             return Vec::new();
         }
@@ -2588,7 +2667,7 @@ impl JailedStream {
                             comment: comment.clone(),
                             error: None,
                         };
-                        (response, sources)
+                        I::from_parts((response, sources))
                     })
                     .collect()
             }
@@ -2609,7 +2688,7 @@ impl JailedStream {
                             comment: comment.clone(),
                             error: None,
                         };
-                        (response, sources)
+                        I::from_parts((response, sources))
                     })
                     .collect()
             }
@@ -2940,7 +3019,7 @@ impl JailedStream {
     ) -> (ChatChoiceStream, Spans) {
         let record = self.recording;
         // Ranges in `accumulated_content`, mapped to input ranges.
-        let sourced = |text: &SourcedText| accumulated_spans.map(&text.spans);
+        let sourced = |text: &SourcedText| accumulated_spans.map(text.spans());
         let whole = || SourcedText::slice(accumulated_content, accumulated_content, record);
         match &self.jail_mode {
             JailMode::MarkerBased => {
@@ -2986,7 +3065,7 @@ impl JailedStream {
                             let choice = create_choice_stream(
                                 choice_index,
                                 Some(Role::Assistant),
-                                &normal_text.text,
+                                normal_text.text(),
                                 None,
                                 base_choice.finish_reason,
                                 base_choice.logprobs.clone(),
@@ -3012,7 +3091,7 @@ impl JailedStream {
                         let choice = create_choice_stream(
                             choice_index,
                             Some(Role::Assistant),
-                            &normal_text.text,
+                            normal_text.text(),
                             Some(tool_call_chunks),
                             base_choice.finish_reason,
                             base_choice.logprobs.clone(),
@@ -3052,7 +3131,7 @@ impl JailedStream {
                             SourcedText::slice(accumulated_content, prefix, record)
                         } else if normal_text
                             .as_ref()
-                            .is_some_and(|normal| normal.text.is_empty())
+                            .is_some_and(|normal| normal.text().is_empty())
                         {
                             SourcedText::empty(record)
                         } else if is_kimi_k3_parser(self.tool_call_parser.as_deref()) {
@@ -3097,7 +3176,7 @@ impl JailedStream {
                         let choice = create_choice_stream(
                             choice_index,
                             Some(Role::Assistant),
-                            &content.text,
+                            content.text(),
                             None,
                             base_choice.finish_reason,
                             base_choice.logprobs.clone(),
@@ -3361,14 +3440,18 @@ impl JailedStream {
     ///
     /// It changes no text, so each item's sources pass through. While
     /// `recording`, a chunk it adds carries an empty entry for its choice.
-    fn fix_finish_reason<S>(
+    fn fix_finish_reason<I, S>(
         input_stream: S,
         jail_mode: JailMode,
         recording: bool,
-    ) -> impl Stream<Item = SourcedItem> + Send
+    ) -> impl Stream<Item = I> + Send
     where
-        S: Stream<Item = SourcedItem> + Send + 'static,
+        I: JailItem,
+        S: Stream<Item = I> + Send + 'static,
     {
+        // Generic over the item type, as the jail loop is: the stock chunk
+        // streams as it is, and compiles the recording branches out.
+        let recording = I::RECORDS && recording;
         // A chunk it adds names a choice; one whose text had no source gets
         // no entry, as the jail gave it none.
         let added = move |index: u32, unsourced: &HashSet<u32>| {
@@ -3398,7 +3481,8 @@ impl JailedStream {
             let mut synthesized: HashSet<u32> = HashSet::new();
 
             let mut unsourced: HashSet<u32> = HashSet::new();
-            while let Some((mut response, sources)) = input_stream.next().await {
+            while let Some(item) = input_stream.next().await {
+                let (mut response, sources) = item.into_parts();
                 // While recording, the jail gives every choice an entry unless
                 // its text has no source.
                 if let (Some(sources), Some(data)) = (&sources, &response.data) {
@@ -3474,7 +3558,7 @@ impl JailedStream {
                         .collect();
                     indices.sort_unstable();
                     for index in indices {
-                        yield (
+                        yield I::from_parts((
                             stream_choice_chunk_from_template(
                                 template,
                                 index,
@@ -3483,12 +3567,12 @@ impl JailedStream {
                                 Some(FinishReason::ToolCalls),
                             ),
                             added(index, &unsourced),
-                        );
+                        ));
                         synthesized.insert(index);
                     }
                 }
 
-                yield (response, sources);
+                yield I::from_parts((response, sources));
             }
 
             // Backstop: the stream ended without a finish_reason AND without an
@@ -3508,7 +3592,7 @@ impl JailedStream {
                     .collect();
                 indices.sort_unstable();
                 for index in indices {
-                    yield (
+                    yield I::from_parts((
                         stream_choice_chunk_from_template(
                             &template,
                             index,
@@ -3517,7 +3601,7 @@ impl JailedStream {
                             Some(FinishReason::ToolCalls),
                         ),
                         added(index, &unsourced),
-                    );
+                    ));
                     synthesized.insert(index);
                 }
             }
