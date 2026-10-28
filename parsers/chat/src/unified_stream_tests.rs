@@ -6257,3 +6257,20 @@ fn public_marker_helpers_skip_quoted_markers() {
 #[path = "unified_stream_sources_tests.rs"]
 #[allow(clippy::single_range_in_vec_init)]
 mod sources;
+
+/// With recording off, `Deltas` is 56 bytes: the per-run range lists hold
+/// one list inline, which cannot share a niche with the vector form, so the
+/// field grew from 24 to 32 bytes. Callgrind on brev counted the stock adapter
+/// at 0.10% fewer instructions per chunk than with a vector there, and the
+/// inline list saves 2.5 allocations per token with recording on, so the size
+/// is kept. It must not grow further.
+#[test]
+fn recording_off_deltas_keep_their_size() {
+    let deltas = Deltas::new(false);
+    assert!(deltas.spans.is_none());
+    let actual = std::mem::size_of_val(&deltas);
+    assert!(
+        actual <= 56,
+        "recording-off Deltas is {actual} bytes; bound 56"
+    );
+}
