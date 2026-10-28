@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dynamo-chat-parsing"
+readme = "README.md"
+version = "0.1.0"
+edition.workspace = true
+description = "The rules an OpenAI chat frontend uses to pick and drive Dynamo's parsers: the parser route, the parser version, and request rules keyed on parser names."
+authors.workspace = true
+license = "Apache-2.0"
+homepage.workspace = true
+repository.workspace = true
+keywords = ["llm", "parser", "tool-calling", "reasoning", "inference"]
+include = ["src/**/*", "Cargo.toml", "README.md"]
+
+[dependencies]
+dynamo-parsers = { workspace = true }
+dynamo-parsers-v2 = { workspace = true }
+dynamo-protocols = { workspace = true }
+dynamo-renderer = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+

@@ -4,6 +4,7 @@ members = [
     "protocols",
     "decisions",
     "parsers/v1",
+    "parsers/chat",
     "parsers/structural-tag",
     "renderer",
     "tokenizers",
@@ -41,6 +42,7 @@ chrono = { version = "0.4", default-features = false, features = [
 clap = "4"
 derive_builder = "0.20"
 dynamo-parsers = { path = "parsers/v1", version = "10.2.2" }
+dynamo-parsers-v2 = { path = "parsers/v2", version = "0.8.2" }
 dynamo-protocols = { path = "protocols", version = "8.4.1" }
 dynamo-decisions = { path = "decisions", version = "0.1.1" }
 dynamo-renderer = { path = "renderer", version = "8.2.1" }
