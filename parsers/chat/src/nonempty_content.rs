@@ -16,7 +16,7 @@ use std::ops::Range;
 
 use dynamo_parsers::chat_stream::{ChatStreamItem, choice_texts};
 use dynamo_parsers::sources::{ChoiceSources, match_choice_sources};
-use dynamo_protocols::types::ChatCompletionMessageContent;
+use dynamo_protocols::types::{ChatChoiceStream, ChatCompletionMessageContent};
 use dynamo_renderer::request_rules::ChatTemplateArgs;
 use futures::{Stream, StreamExt};
 
@@ -25,44 +25,45 @@ use crate::families::selected_family;
 use crate::reasoning_off::is_reasoning_disabled_by_request;
 use crate::version::ParserVersion;
 
+/// The input ranges of a choice's held text, kept only while recording.
+#[derive(Default)]
+struct HeldSources {
+    reasoning: Vec<Range<usize>>,
+    content: Vec<Range<usize>>,
+}
+
 #[derive(Default)]
 struct DeferredUnifiedChoice {
     pending_reasoning: String,
     pending_content: String,
     saw_visible_output: bool,
     drained: bool,
-    // While the items carry a source slot: the input ranges of the held text.
-    // They stay empty, and allocate nothing, on the stock path.
-    pending_reasoning_sources: Vec<Range<usize>>,
-    pending_content_sources: Vec<Range<usize>>,
     // Text of this choice arrived without ranges, so its output gets no entry.
     unsourced: bool,
-}
-
-/// Held text that a choice releases, with its input ranges.
-#[derive(Default)]
-struct Released {
-    content: Option<String>,
-    reasoning: Option<String>,
-    content_sources: Vec<Range<usize>>,
-    reasoning_sources: Vec<Range<usize>>,
+    // While recording, the input ranges of the held text. They sit behind a
+    // box that the stock path never allocates, so the state and what
+    // `release_split` and `drain` return stay the size they were before
+    // recording: the wider shapes cost the stock deferral 4.7% more
+    // instructions per chunk on brev.
+    held: Option<Box<HeldSources>>,
 }
 
 impl DeferredUnifiedChoice {
-    fn release_split(&mut self) -> Released {
+    fn release_split(&mut self) -> (Option<String>, Option<String>) {
         let content = std::mem::take(&mut self.pending_content);
         let reasoning = std::mem::take(&mut self.pending_reasoning);
-        Released {
-            content: (!content.is_empty()).then_some(content),
-            reasoning: (!reasoning.is_empty()).then_some(reasoning),
-            content_sources: std::mem::take(&mut self.pending_content_sources),
-            reasoning_sources: std::mem::take(&mut self.pending_reasoning_sources),
-        }
+        (
+            (!content.is_empty()).then_some(content),
+            (!reasoning.is_empty()).then_some(reasoning),
+        )
     }
 
-    fn drain(&mut self) -> Released {
+    /// Releases the held text at a finish. Held ranges are rearranged to
+    /// match: when reasoning surfaces as content, its ranges become the
+    /// content's.
+    fn drain(&mut self) -> (Option<String>, Option<String>) {
         if self.drained {
-            return Released::default();
+            return (None, None);
         }
         self.drained = true;
         if self.saw_visible_output {
@@ -70,20 +71,30 @@ impl DeferredUnifiedChoice {
         }
         let reasoning = std::mem::take(&mut self.pending_reasoning);
         let content = std::mem::take(&mut self.pending_content);
-        let reasoning_sources = std::mem::take(&mut self.pending_reasoning_sources);
-        let content_sources = std::mem::take(&mut self.pending_content_sources);
+        let held = self.held.as_deref_mut();
         if !reasoning.trim().is_empty() {
-            Released {
-                content: Some(reasoning),
-                content_sources: reasoning_sources,
-                ..Released::default()
+            if let Some(held) = held {
+                held.content = std::mem::take(&mut held.reasoning);
             }
+            (Some(reasoning), None)
         } else {
-            Released {
-                content: (!content.is_empty()).then_some(content),
-                content_sources,
-                ..Released::default()
+            if let Some(held) = held {
+                held.reasoning.clear();
             }
+            ((!content.is_empty()).then_some(content), None)
+        }
+    }
+
+    /// The held ranges, to add to while recording.
+    fn held(&mut self) -> &mut HeldSources {
+        self.held.get_or_insert_default()
+    }
+
+    /// The held ranges of text just released, when it released any.
+    fn take_held(&mut self, released: bool) -> HeldSources {
+        match self.held.as_deref_mut() {
+            Some(held) if released => std::mem::take(held),
+            _ => HeldSources::default(),
         }
     }
 }
@@ -171,6 +182,223 @@ pub fn stream_can_defer_all_output(
         && !is_reasoning_disabled_by_request(reasoning_parser, chat_template_args)
 }
 
+/// The deferral of one chunk: it edits `response` in place, writes the prefix
+/// choices to emit before it into `prefix_choices`, and returns `false` when
+/// the chunk has no data. It is a plain function so that its locals stay out
+/// of the stream's state, which is held across every yield, and it writes
+/// into the caller's buffer rather than returning one, which cost a copy per
+/// chunk.
+fn defer_chunk<I: PolicyStreamItem>(
+    states: &mut HashMap<u32, DeferredUnifiedChoice>,
+    last_response: &mut Option<I>,
+    response: &mut I,
+    prefix_choices: &mut Vec<(ChatChoiceStream, Option<ChoiceSources>)>,
+) -> bool {
+    // While recording, the input slot gives each choice's ranges and
+    // the output slot gets the ranges of the text this stage emits.
+    let entries = response.sources_mut().map(std::mem::take);
+    let recording = entries.is_some();
+    let texts = match &entries {
+        Some(_) => response
+            .chunk()
+            .map_or_else(Vec::new, |data| choice_texts(&data.choices)),
+        None => Vec::new(),
+    };
+    let mut matched = entries.map(|entries| match_choice_sources(entries, &texts));
+    let mut output_sources: Vec<ChoiceSources> = Vec::new();
+    let Some(data) = response.chunk_mut() else {
+        return false;
+    };
+
+    for (position, choice) in data.choices.iter_mut().enumerate() {
+        let state = states.entry(choice.index).or_default();
+        if choice.delta.content.is_some()
+            || choice.delta.reasoning_content.is_some()
+            || choice.delta.tool_calls.is_some()
+        {
+            state.drained = false;
+        }
+        let given = matched
+            .as_mut()
+            .and_then(|matched| matched.get_mut(position)?.take());
+        if recording
+            && given.is_none()
+            && texts
+                .get(position)
+                .is_some_and(|text| text.content_len + text.reasoning_len > 0)
+        {
+            state.unsourced = true;
+        }
+        let (mut content_sources, mut reasoning_sources) = given
+            .map(|given| (given.content, given.reasoning))
+            .unwrap_or_default();
+
+        if !state.saw_visible_output
+            && let Some(reasoning) = choice.delta.reasoning_content.take()
+        {
+            state.pending_reasoning.push_str(&reasoning);
+            if recording {
+                state.held().reasoning.append(&mut reasoning_sources);
+            }
+        }
+
+        let carries_parts = matches!(
+            choice.delta.content,
+            Some(ChatCompletionMessageContent::Parts(_))
+        );
+        match choice.delta.content.take() {
+            Some(ChatCompletionMessageContent::Text(text)) => {
+                if !state.saw_visible_output && text.trim().is_empty() {
+                    state.pending_content.push_str(&text);
+                    if recording {
+                        state.held().content.append(&mut content_sources);
+                    }
+                } else {
+                    if !text.trim().is_empty() {
+                        state.saw_visible_output = true;
+                    }
+                    let mut content = std::mem::take(&mut state.pending_content);
+                    content.push_str(&text);
+                    choice.delta.content = Some(ChatCompletionMessageContent::Text(content));
+                    if recording {
+                        let mut held = std::mem::take(&mut state.held().content);
+                        held.append(&mut content_sources);
+                        content_sources = held;
+                    }
+                }
+            }
+            Some(parts @ ChatCompletionMessageContent::Parts(_)) => {
+                choice.delta.content = Some(parts);
+            }
+            None => {}
+        }
+
+        let has_tool_calls = choice
+            .delta
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty());
+        if carries_parts || has_tool_calls {
+            state.saw_visible_output = true;
+        }
+        if carries_parts {
+            state.pending_content.clear();
+            if let Some(held) = state.held.as_deref_mut() {
+                held.content.clear();
+            }
+        }
+
+        if state.saw_visible_output {
+            let (content, reasoning) = state.release_split();
+            let mut held = state.take_held(recording && (content.is_some() || reasoning.is_some()));
+            if let Some(reasoning) = reasoning {
+                let mut prefix = choice.clone();
+                prefix.delta.role = None;
+                prefix.delta.content = None;
+                prefix.delta.tool_calls = None;
+                prefix.delta.function_call = None;
+                prefix.delta.refusal = None;
+                prefix.delta.reasoning_content = Some(reasoning);
+                prefix.finish_reason = None;
+                prefix.logprobs = None;
+                let sources = entry(
+                    recording,
+                    state.unsourced,
+                    choice.index,
+                    Vec::new(),
+                    std::mem::take(&mut held.reasoning),
+                );
+                prefix_choices.push((prefix, sources));
+            }
+            if let Some(content) = content {
+                match choice.delta.content.as_mut() {
+                    Some(ChatCompletionMessageContent::Text(existing)) => {
+                        existing.insert_str(0, &content);
+                        let mut front = std::mem::take(&mut held.content);
+                        front.append(&mut content_sources);
+                        content_sources = front;
+                    }
+                    Some(ChatCompletionMessageContent::Parts(_)) | None => {
+                        let mut prefix = choice.clone();
+                        prefix.delta.role = None;
+                        prefix.delta.content = Some(ChatCompletionMessageContent::Text(content));
+                        prefix.delta.tool_calls = None;
+                        prefix.delta.function_call = None;
+                        prefix.delta.refusal = None;
+                        prefix.delta.reasoning_content = None;
+                        prefix.finish_reason = None;
+                        prefix.logprobs = None;
+                        let sources = entry(
+                            recording,
+                            state.unsourced,
+                            choice.index,
+                            std::mem::take(&mut held.content),
+                            Vec::new(),
+                        );
+                        prefix_choices.push((prefix, sources));
+                    }
+                }
+            }
+        }
+
+        if choice.finish_reason.is_some() {
+            let (content, reasoning) = state.drain();
+            let mut held = state.take_held(recording && (content.is_some() || reasoning.is_some()));
+            if let Some(content) = content {
+                match choice.delta.content.as_mut() {
+                    Some(ChatCompletionMessageContent::Text(existing)) => {
+                        existing.push_str(&content);
+                        content_sources.append(&mut held.content);
+                    }
+                    Some(ChatCompletionMessageContent::Parts(_)) => {}
+                    None => {
+                        choice.delta.content = Some(ChatCompletionMessageContent::Text(content));
+                        content_sources.append(&mut held.content);
+                    }
+                }
+            }
+            if let Some(reasoning) = reasoning {
+                choice
+                    .delta
+                    .reasoning_content
+                    .get_or_insert_default()
+                    .push_str(&reasoning);
+                reasoning_sources.append(&mut held.reasoning);
+            }
+        }
+
+        if recording {
+            // Held text took its ranges with it; what stays on the
+            // choice keeps its own.
+            if choice.delta.reasoning_content.is_none() {
+                reasoning_sources.clear();
+            }
+            if !matches!(
+                choice.delta.content,
+                Some(ChatCompletionMessageContent::Text(_))
+            ) {
+                content_sources.clear();
+            }
+            output_sources.extend(entry(
+                recording,
+                state.unsourced,
+                choice.index,
+                content_sources,
+                reasoning_sources,
+            ));
+        }
+    }
+
+    let has_choices = !data.choices.is_empty();
+    if recording && let Some(slot) = response.sources_mut() {
+        *slot = output_sources;
+    }
+    if has_choices {
+        *last_response = Some(response.clone());
+    }
+    true
+}
+
 /// Apply the request-level non-empty-content contract after a unified parser has
 /// already split reasoning, content, and tool calls.
 ///
@@ -187,6 +415,7 @@ where
     async_stream::stream! {
         let mut states: HashMap<u32, DeferredUnifiedChoice> = HashMap::new();
         let mut last_response: Option<I> = None;
+        let mut prefix_choices = Vec::new();
         tokio::pin!(stream_in);
 
         while let Some(mut response) = stream_in.next().await {
@@ -194,197 +423,11 @@ where
                 yield response;
                 return;
             }
-            // While recording, the input slot gives each choice's ranges and
-            // the output slot gets the ranges of the text this stage emits.
-            let entries = response.sources_mut().map(std::mem::take);
-            let recording = entries.is_some();
-            let texts = match &entries {
-                Some(_) => response.chunk().map_or_else(Vec::new, |data| choice_texts(&data.choices)),
-                None => Vec::new(),
-            };
-            let mut matched = entries.map(|entries| match_choice_sources(entries, &texts));
-            let mut output_sources: Vec<ChoiceSources> = Vec::new();
-            let Some(data) = response.chunk_mut() else {
+            if !defer_chunk(&mut states, &mut last_response, &mut response, &mut prefix_choices) {
                 yield response;
                 continue;
-            };
-            let mut prefix_choices = Vec::new();
-
-            for (position, choice) in data.choices.iter_mut().enumerate() {
-                let state = states.entry(choice.index).or_default();
-                if choice.delta.content.is_some()
-                    || choice.delta.reasoning_content.is_some()
-                    || choice.delta.tool_calls.is_some()
-                {
-                    state.drained = false;
-                }
-                let given = matched
-                    .as_mut()
-                    .and_then(|matched| matched.get_mut(position)?.take());
-                if recording
-                    && given.is_none()
-                    && texts.get(position).is_some_and(|text| text.content_len + text.reasoning_len > 0)
-                {
-                    state.unsourced = true;
-                }
-                let (mut content_sources, mut reasoning_sources) = given
-                    .map(|given| (given.content, given.reasoning))
-                    .unwrap_or_default();
-
-                if !state.saw_visible_output
-                    && let Some(reasoning) = choice.delta.reasoning_content.take()
-                {
-                    state.pending_reasoning.push_str(&reasoning);
-                    state.pending_reasoning_sources.append(&mut reasoning_sources);
-                }
-
-                let carries_parts = matches!(
-                    choice.delta.content,
-                    Some(ChatCompletionMessageContent::Parts(_))
-                );
-                match choice.delta.content.take() {
-                    Some(ChatCompletionMessageContent::Text(text)) => {
-                        if !state.saw_visible_output && text.trim().is_empty() {
-                            state.pending_content.push_str(&text);
-                            state.pending_content_sources.append(&mut content_sources);
-                        } else {
-                            if !text.trim().is_empty() {
-                                state.saw_visible_output = true;
-                            }
-                            let mut content = std::mem::take(&mut state.pending_content);
-                            content.push_str(&text);
-                            choice.delta.content =
-                                Some(ChatCompletionMessageContent::Text(content));
-                            let mut held = std::mem::take(&mut state.pending_content_sources);
-                            held.append(&mut content_sources);
-                            content_sources = held;
-                        }
-                    }
-                    Some(parts @ ChatCompletionMessageContent::Parts(_)) => {
-                        choice.delta.content = Some(parts);
-                    }
-                    None => {}
-                }
-
-                let has_tool_calls = choice
-                    .delta
-                    .tool_calls
-                    .as_ref()
-                    .is_some_and(|calls| !calls.is_empty());
-                if carries_parts || has_tool_calls {
-                    state.saw_visible_output = true;
-                }
-                if carries_parts {
-                    state.pending_content.clear();
-                    state.pending_content_sources.clear();
-                }
-
-                if state.saw_visible_output {
-                    let released = state.release_split();
-                    if let Some(reasoning) = released.reasoning {
-                        let mut prefix = choice.clone();
-                        prefix.delta.role = None;
-                        prefix.delta.content = None;
-                        prefix.delta.tool_calls = None;
-                        prefix.delta.function_call = None;
-                        prefix.delta.refusal = None;
-                        prefix.delta.reasoning_content = Some(reasoning);
-                        prefix.finish_reason = None;
-                        prefix.logprobs = None;
-                        let sources = entry(
-                            recording,
-                            state.unsourced,
-                            choice.index,
-                            Vec::new(),
-                            released.reasoning_sources,
-                        );
-                        prefix_choices.push((prefix, sources));
-                    }
-                    if let Some(content) = released.content {
-                        match choice.delta.content.as_mut() {
-                            Some(ChatCompletionMessageContent::Text(existing)) => {
-                                existing.insert_str(0, &content);
-                                let mut held = released.content_sources;
-                                held.append(&mut content_sources);
-                                content_sources = held;
-                            }
-                            Some(ChatCompletionMessageContent::Parts(_)) | None => {
-                                let mut prefix = choice.clone();
-                                prefix.delta.role = None;
-                                prefix.delta.content =
-                                    Some(ChatCompletionMessageContent::Text(content));
-                                prefix.delta.tool_calls = None;
-                                prefix.delta.function_call = None;
-                                prefix.delta.refusal = None;
-                                prefix.delta.reasoning_content = None;
-                                prefix.finish_reason = None;
-                                prefix.logprobs = None;
-                                let sources = entry(
-                                    recording,
-                                    state.unsourced,
-                                    choice.index,
-                                    released.content_sources,
-                                    Vec::new(),
-                                );
-                                prefix_choices.push((prefix, sources));
-                            }
-                        }
-                    }
-                }
-
-                if choice.finish_reason.is_some() {
-                    let mut released = state.drain();
-                    if let Some(content) = released.content {
-                        match choice.delta.content.as_mut() {
-                            Some(ChatCompletionMessageContent::Text(existing)) => {
-                                existing.push_str(&content);
-                                content_sources.append(&mut released.content_sources);
-                            }
-                            Some(ChatCompletionMessageContent::Parts(_)) => {}
-                            None => {
-                                choice.delta.content =
-                                    Some(ChatCompletionMessageContent::Text(content));
-                                content_sources.append(&mut released.content_sources);
-                            }
-                        }
-                    }
-                    if let Some(reasoning) = released.reasoning {
-                        choice
-                            .delta
-                            .reasoning_content
-                            .get_or_insert_default()
-                            .push_str(&reasoning);
-                        reasoning_sources.append(&mut released.reasoning_sources);
-                    }
-                }
-
-                if recording {
-                    // Held text took its ranges with it; what stays on the
-                    // choice keeps its own.
-                    if choice.delta.reasoning_content.is_none() {
-                        reasoning_sources.clear();
-                    }
-                    if !matches!(choice.delta.content, Some(ChatCompletionMessageContent::Text(_))) {
-                        content_sources.clear();
-                    }
-                    output_sources.extend(entry(
-                        recording,
-                        state.unsourced,
-                        choice.index,
-                        content_sources,
-                        reasoning_sources,
-                    ));
-                }
             }
-
-            let has_choices = !data.choices.is_empty();
-            if recording && let Some(slot) = response.sources_mut() {
-                *slot = output_sources;
-            }
-            if has_choices {
-                last_response = Some(response.clone());
-            }
-            for (prefix_choice, sources) in prefix_choices {
+            for (prefix_choice, sources) in prefix_choices.drain(..) {
                 let mut prefix_response = response.clone();
                 prefix_response.scrub_synthetic();
                 if let Some(prefix_data) = prefix_response.chunk_mut() {
@@ -406,9 +449,10 @@ where
             .filter_map(|index| {
                 let state = states.get_mut(&index)?;
                 let unsourced = state.unsourced;
-                let released = state.drain();
-                (released.content.is_some() || released.reasoning.is_some())
-                    .then_some((index, released, unsourced))
+                let (content, reasoning) = state.drain();
+                let released = content.is_some() || reasoning.is_some();
+                let held = state.take_held(released);
+                released.then_some((index, (content, reasoning), held, unsourced))
             })
             .collect();
         if !flushed.is_empty()
@@ -422,13 +466,13 @@ where
             let mut flushed = flushed;
             let sources: Vec<ChoiceSources> = flushed
                 .iter_mut()
-                .filter_map(|(index, released, unsourced)| {
+                .filter_map(|(index, _, held, unsourced)| {
                     entry(
                         recording,
                         *unsourced,
                         *index,
-                        std::mem::take(&mut released.content_sources),
-                        std::mem::take(&mut released.reasoning_sources),
+                        std::mem::take(&mut held.content),
+                        std::mem::take(&mut held.reasoning),
                     )
                 })
                 .collect();
@@ -440,15 +484,15 @@ where
             {
                 data.choices = flushed
                     .into_iter()
-                    .map(|(index, released, _)| {
+                    .map(|(index, (content, reasoning), _, _)| {
                         let mut choice = template.clone();
                         choice.index = index;
                         choice.delta.role = None;
-                        choice.delta.content = released.content.map(ChatCompletionMessageContent::Text);
+                        choice.delta.content = content.map(ChatCompletionMessageContent::Text);
                         choice.delta.tool_calls = None;
                         choice.delta.function_call = None;
                         choice.delta.refusal = None;
-                        choice.delta.reasoning_content = released.reasoning;
+                        choice.delta.reasoning_content = reasoning;
                         choice.finish_reason = None;
                         choice.logprobs = None;
                         choice
@@ -499,5 +543,23 @@ where
         if !transport_failed && let Some(usage) = pending_usage {
             yield usage;
         }
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    /// A choice's deferral state is its fields before source recording plus
+    /// one pointer: held ranges sit behind a box the stock path never fills.
+    /// With them inline, the state grew from 56 to 104 bytes and the stock
+    /// deferral ran 4.7% more instructions per chunk on brev.
+    #[test]
+    fn the_choice_state_holds_ranges_out_of_line() {
+        assert!(
+            std::mem::size_of::<DeferredUnifiedChoice>() <= 64,
+            "the deferral state is {} bytes",
+            std::mem::size_of::<DeferredUnifiedChoice>()
+        );
     }
 }
