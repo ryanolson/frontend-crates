@@ -212,6 +212,24 @@ impl Spans {
         }
     }
 
+    /// [`into_ranges`](Self::into_ranges), writing one range into a vector
+    /// from `spares` that has room, such as an input entry's list, so a stage
+    /// that takes in one list per string and puts out one allocates none.
+    pub(crate) fn into_ranges_from(self, spares: &mut [Vec<Range<usize>>]) -> Vec<Range<usize>> {
+        match self.0 {
+            Repr::One(range) => match spares.iter_mut().find(|spare| spare.capacity() > 0) {
+                Some(spare) => {
+                    let mut out = std::mem::take(spare);
+                    out.clear();
+                    out.push(range);
+                    out
+                }
+                None => vec![range],
+            },
+            repr => Spans(repr).into_ranges(),
+        }
+    }
+
     /// The number of string bytes these ranges cover.
     pub(crate) fn len(&self) -> usize {
         self.ranges().iter().map(|r| r.len()).sum()
