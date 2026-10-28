@@ -503,3 +503,56 @@ async fn review_f5_contentless_duplicate_does_not_steal_policy_sources() {
         "contentless duplicates break tiling (policy, text bytes, source bytes): {violations:?}"
     );
 }
+
+#[tokio::test]
+#[ignore = "F6: the reasoning-off fold resumes source entries after a text gap"]
+async fn review_f6_fold_keeps_a_choice_unsourced_after_a_gap() {
+    let mut violations = Vec::new();
+    for (label, first_delta) in [
+        ("content", json!({"content": "gap"})),
+        ("reasoning", json!({"reasoning_content": "gap"})),
+    ] {
+        let chunks = vec![
+            chunk(vec![json!({"index": 0, "delta": first_delta})]),
+            chunk(vec![
+                json!({"index": 0, "delta": {"reasoning_content": "R", "content": "A"}}),
+                json!({"index": 1, "delta": {"content": "B"}}),
+            ]),
+            chunk(vec![json!({"index": 0, "delta": {"content": "C"}})]),
+        ];
+        let mut input = with_sources(&chunks);
+        input[0].sources = Some(vec![]);
+
+        // Seeing a choice with no text must not disable its later entries.
+        let mut control = input.clone();
+        control[0].chunk = chunk(vec![json!({"index": 0, "delta": {}})]);
+        let control: Vec<_> = fold(stream::iter(control).boxed()).collect().await;
+        for item in &control[1..] {
+            assert!(item.sources().unwrap().iter().any(|entry| entry.index == 0));
+        }
+
+        let output: Vec<_> = fold(stream::iter(input).boxed()).collect().await;
+        assert!(output[0].sources().unwrap().is_empty());
+        assert_eq!(
+            text_of(&output[1].chunk().unwrap().choices[0].delta.content),
+            "RA"
+        );
+        assert!(
+            output[1]
+                .sources()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.index == 1),
+            "the other choice remains sourced"
+        );
+        for (step, item) in output.iter().enumerate().skip(1) {
+            if item.sources().unwrap().iter().any(|entry| entry.index == 0) {
+                violations.push((label, step));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "folded entries resume after a source gap (channel, chunk): {violations:?}"
+    );
+}
