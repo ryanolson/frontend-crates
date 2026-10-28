@@ -32,6 +32,8 @@ mod spans;
 pub mod special_tokens;
 pub mod stop_tokens;
 pub mod stream_item;
+#[cfg(test)]
+mod test_allocations;
 pub mod tools;
 pub mod unified_stream;
 pub mod version;

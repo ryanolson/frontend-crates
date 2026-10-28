@@ -977,32 +977,6 @@ fn usage_flush_checks_sources_before_emitting_held_text() {
     }
 }
 
-thread_local! {
-    static REVIEW_SOURCE_ALLOCATIONS: std::cell::Cell<Option<(usize, usize)>> =
-        const { std::cell::Cell::new(None) };
-}
-
-struct SourceReviewAllocator;
-
-unsafe impl std::alloc::GlobalAlloc for SourceReviewAllocator {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let pointer = unsafe { std::alloc::System.alloc(layout) };
-        let _ = REVIEW_SOURCE_ALLOCATIONS.try_with(|count| {
-            if let Some((allocations, bytes)) = count.get() {
-                count.set(Some((allocations + 1, bytes + layout.size())));
-            }
-        });
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
-        unsafe { std::alloc::System.dealloc(pointer, layout) };
-    }
-}
-
-#[global_allocator]
-static SOURCE_REVIEW_ALLOCATOR: SourceReviewAllocator = SourceReviewAllocator;
-
 #[test]
 fn stock_qwen_restoration_allocates_only_the_choice_and_envelope() {
     let mut item = text_chunk(0, None, Some("queued"), false);
@@ -1019,9 +993,10 @@ fn stock_qwen_restoration_allocates_only_the_choice_and_envelope() {
             annotation: (None, None, None, None),
         });
 
-    REVIEW_SOURCE_ALLOCATIONS.with(|count| count.set(Some((0, 0))));
+    use crate::test_allocations::{allocations, bytes};
+    let before = (allocations(), bytes());
     let restored = take_qwen_reasoning_response(&mut record);
-    let observed = REVIEW_SOURCE_ALLOCATIONS.with(|count| count.replace(None).unwrap());
+    let observed = (allocations() - before.0, bytes() - before.1);
     let expected_bytes = std::mem::size_of::<ChatChoiceStream>()
         + std::mem::size_of::<(NvCreateChatCompletionStreamResponse, AnnotationParts)>();
     assert_eq!(
