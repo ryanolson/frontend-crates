@@ -2401,6 +2401,18 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         pending
     }
 
+    /// Whether input is held that could still be emitted, or whose meaning is
+    /// still open: buffered bytes, a held tool block, a deferred parse error, or
+    /// an open block. Even a complete reasoning opener held alone counts: inside
+    /// a quote, or on `reset`, it surfaces as text, and its bytes were fed
+    /// before the source offsets start.
+    pub(crate) fn holds_input(&self) -> bool {
+        !self.buffer.is_empty()
+            || !self.uncommitted_block.text.is_empty()
+            || self.pending_parse_error.is_some()
+            || self.in_block
+    }
+
     /// Record the input ranges of committed Text and Reasoning bytes from now on.
     pub(crate) fn record_sources(&mut self) {
         self.sources.get_or_insert_with(ScanSources::default);

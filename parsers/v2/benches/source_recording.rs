@@ -5,7 +5,10 @@
 //!
 //! Each family parses every native input in its conformance corpus, four
 //! characters per chunk, and the bench prints the median nanoseconds per input
-//! byte over the repeats. Parser construction is outside the timed loop.
+//! byte over the repeats, with half the range over the median. Parser
+//! construction is outside the timed loop. The recording-off pass is the stock
+//! path: it calls no recording method, so the same pass also runs on a commit
+//! that has none.
 //!
 //! ```text
 //! cargo bench -p dynamo-parsers-v2 --bench source_recording
@@ -111,30 +114,49 @@ fn corpus(family: &str) -> Option<Vec<Case>> {
     Some(cases)
 }
 
-fn parsers(family: &str, cases: &[Case], record: bool) -> Vec<Box<dyn UnifiedParser>> {
+fn parsers(family: &str, cases: &[Case]) -> Vec<Box<dyn UnifiedParser>> {
     cases
         .iter()
         .map(|case| {
             let mut parser = create_unified_parser_for_family(family, &case.tools).unwrap();
             parser.initialize_request(case.init.clone()).unwrap();
-            if record {
-                assert!(parser.record_sources(), "{family} refused to record");
-            }
             parser
         })
         .collect()
 }
 
-/// Parse every case once and return the elapsed nanoseconds.
-fn pass(family: &str, cases: &[Case], record: bool) -> u128 {
-    let mut parsers = parsers(family, cases, record);
+/// The stock path, as dynamo-llm drives it: parse and finish, no recording.
+/// Returns the elapsed nanoseconds for one pass over every case.
+fn stock_pass(family: &str, cases: &[Case]) -> u128 {
+    let mut parsers = parsers(family, cases);
+    let mut output = UnifiedParserOutput::default();
+    let start = Instant::now();
+    for (parser, case) in parsers.iter_mut().zip(cases) {
+        for chunk in &case.chunks {
+            output.events.clear();
+            // A parse error is part of some cases; recovery is not timed here.
+            if parser.parse_into(chunk, &mut output).is_err() {
+                break;
+            }
+            black_box(&output);
+        }
+        black_box(parser.finish().ok());
+    }
+    start.elapsed().as_nanos()
+}
+
+/// The same pass with recording on, taking the ranges after every call.
+fn recording_pass(family: &str, cases: &[Case]) -> u128 {
+    let mut parsers = parsers(family, cases);
+    for parser in &mut parsers {
+        assert!(parser.record_sources(), "{family} refused to record");
+    }
     let mut output = UnifiedParserOutput::default();
     let mut ranges = Vec::new();
     let start = Instant::now();
     for (parser, case) in parsers.iter_mut().zip(cases) {
         for chunk in &case.chunks {
             output.events.clear();
-            // A parse error is part of some cases; recovery is not timed here.
             if parser.parse_into(chunk, &mut output).is_err() {
                 break;
             }
@@ -150,17 +172,17 @@ fn pass(family: &str, cases: &[Case], record: bool) -> u128 {
     start.elapsed().as_nanos()
 }
 
-fn median(mut samples: Vec<u128>) -> u128 {
+/// Median nanoseconds per input byte, and half the range over the median.
+fn summary(mut samples: Vec<u128>, bytes: usize) -> (f64, f64) {
     samples.sort_unstable();
-    samples[samples.len() / 2]
+    let median = samples[samples.len() / 2] as f64;
+    let spread = (samples[samples.len() - 1] - samples[0]) as f64 / 2.0 / median;
+    (median / bytes as f64, spread * 100.0)
 }
 
 fn main() {
     let bench = std::env::args().any(|arg| arg == "--bench");
     let repeats = if bench { REPEATS } else { 1 };
-    if bench {
-        println!("family        bytes   off ns/B   on ns/B   on/off");
-    }
     for family in FAMILIES {
         let Some(cases) = corpus(family) else {
             println!("{family}: corpus not found, skipped");
@@ -174,16 +196,16 @@ fn main() {
         let mut off = Vec::new();
         let mut on = Vec::new();
         for _ in 0..repeats {
-            off.push(pass(family, &cases, false));
-            on.push(pass(family, &cases, true));
+            off.push(stock_pass(family, &cases));
+            on.push(recording_pass(family, &cases));
         }
         if bench {
-            let off = median(off) as f64 / bytes as f64;
-            let on = median(on) as f64 / bytes as f64;
+            let (off, off_spread) = summary(off, bytes);
+            let (on, on_spread) = summary(on, bytes);
             println!(
-                "{family:<12} {bytes:>7} {off:>10.1} {on:>9.1} {:>8.3}",
-                on / off
+                "{family} recording off: {off:.2} ns/byte (+/-{off_spread:.1}%, {bytes} bytes)"
             );
+            println!("{family} recording on: {on:.2} ns/byte (+/-{on_spread:.1}%, {bytes} bytes)");
         }
     }
 }

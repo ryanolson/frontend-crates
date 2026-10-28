@@ -20,8 +20,8 @@ use common::Init;
 use common::source_ranges::{Tally, check_all, check_splits};
 use common::unified_capture::{InputChunk, replay_chunks};
 use dynamo_parsers_v2::{
-    REGISTERED_UNIFIED_FAMILIES, Tool, UnifiedParser, UnifiedParserInit, UnifiedParserOutput,
-    UnifiedToolOutputMode, create_unified_parser_for_family,
+    REGISTERED_UNIFIED_FAMILIES, Tool, UnifiedParser, UnifiedParserEvent, UnifiedParserInit,
+    UnifiedParserOutput, UnifiedToolOutputMode, create_unified_parser_for_family,
 };
 
 /// Families whose parser records sources. Every other built-in family must
@@ -218,18 +218,49 @@ fn guided_requests_refuse_to_record() {
     assert!(checked > 0);
 }
 
+/// After input, recording starts only when nothing held could surface, and its
+/// offsets count from there. Harmony records only before its first parse; a
+/// scanner family that still holds a byte of `a ` refuses. When recording
+/// starts, the next text reads back from offset 0. (A held prompt prefix is
+/// `parsers/v2/tests/source_ranges_prompt_prefix.rs`.)
 #[test]
-fn recording_is_refused_after_parsing_starts() {
+fn recording_after_input_counts_from_where_it_starts() {
+    let mut recorded = 0;
     for family in RECORDING {
         let mut parser = create_unified_parser_for_family(family, &[]).unwrap();
         parser
             .initialize_request(UnifiedParserInit::default())
             .unwrap();
         parser
-            .parse_into("a", &mut UnifiedParserOutput::default())
+            .parse_into("a ", &mut UnifiedParserOutput::default())
             .unwrap();
-        assert!(!parser.record_sources(), "{family}");
+        if *family == "gpt_oss" {
+            assert!(!parser.record_sources(), "{family}");
+            continue;
+        }
+        if !parser.record_sources() {
+            continue;
+        }
+        recorded += 1;
+        let mut output = UnifiedParserOutput::default();
+        parser.parse_into("bc ", &mut output).unwrap();
+        output.append(&mut parser.finish().unwrap());
+        let mut ranges = Vec::new();
+        parser.take_sources(&mut ranges);
+        let text: String = output
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                UnifiedParserEvent::Text(text) | UnifiedParserEvent::Reasoning(text) => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        let read: String = ranges.iter().map(|range| &"bc "[range.clone()]).collect();
+        assert_eq!(read, text, "{family}");
     }
+    assert!(recorded >= 5, "{recorded} families recorded after input");
 }
 
 #[test]

@@ -451,12 +451,17 @@ pub trait UnifiedParser: Send {
 
     /// Record the input byte range behind every committed Text and Reasoning byte.
     ///
-    /// Call after [`Self::initialize_request`] and before the first parse. Feed
-    /// text only: while recording, [`Self::parse_token_ids_into`] fails. Offsets
-    /// count the text this instance received through [`Self::parse_into`] since
-    /// recording was turned on, and keep counting across [`Self::reset`] and a new
-    /// request. Returns `false` when this parser cannot record exact ranges, so the
-    /// caller can refuse the request. Guided tool output never records.
+    /// Call after [`Self::initialize_request`], and after a prompt prefix that
+    /// the caller replays through [`Self::parse_into`], before the generated
+    /// text. Feed text only: while recording, [`Self::parse_token_ids_into`]
+    /// fails. Offsets count the text this instance received through
+    /// [`Self::parse_into`] since recording was turned on, and keep counting
+    /// across [`Self::reset`] and a new request. Returns `false` when this parser
+    /// cannot record exact ranges, so the caller can refuse the request. Guided
+    /// tool output never records. A replayed prefix that leaves bytes held (any
+    /// part of Gemma 4's `<|channel>thought\n` header short of the whole, a bare
+    /// `<|channel>` included) refuses too: those prompt bytes can surface as
+    /// output, and they have no offset in the generated text.
     ///
     /// The families on the shared scanner and GPT-OSS record. Kimi K3, Muse
     /// Glimmer, and Muse Spark return `false`.
@@ -925,8 +930,16 @@ impl<E: InvokeEmitter + Send> NativeUnified for ScannerUnified<E> {
     /// The shared scanner commits text only as verbatim buffer prefixes, so every
     /// family on it records exact ranges.
     fn record_sources(&mut self) -> bool {
+        // Held bytes, from a replayed prompt prefix, would surface with no source.
+        if self.scanner.holds_input() {
+            return false;
+        }
         self.scanner.record_sources();
         true
+    }
+
+    fn records_from_here(&self) -> bool {
+        !self.scanner.holds_input()
     }
 
     fn take_sources(&mut self, out: &mut Vec<std::ops::Range<usize>>) {
@@ -1040,6 +1053,13 @@ pub(crate) trait NativeUnified {
 
     /// See [`UnifiedParser::record_sources`]. Native mode only.
     fn record_sources(&mut self) -> bool {
+        false
+    }
+
+    /// Whether recording can start now, after some input was parsed: true only
+    /// when no input byte is held that could surface later. The default
+    /// records only before the first parse.
+    fn records_from_here(&self) -> bool {
         false
     }
 
@@ -1334,7 +1354,11 @@ impl<N: NativeUnified> GuidedRouted<N> {
 
 impl<N: NativeUnified + Send> UnifiedParser for GuidedRouted<N> {
     fn record_sources(&mut self) -> bool {
-        if self.started || self.finished || self.guided.is_some() {
+        if self.finished || self.guided.is_some() {
+            return false;
+        }
+        // After input, only a native that holds none of it can count from here.
+        if self.started && !self.native.records_from_here() {
             return false;
         }
         self.recording = self.native.record_sources();
