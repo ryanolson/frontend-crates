@@ -3,6 +3,7 @@
 
 pub mod chat_stream;
 pub mod reasoning;
+pub mod sources;
 pub mod tool_calling;
 
 // Re-export everything from tool_calling for convenience
