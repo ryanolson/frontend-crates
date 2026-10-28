@@ -218,8 +218,14 @@ impl UnifiedParser for TagParser {
         self.ids.get(tool_index).map(String::as_str)
     }
 
+    /// As the real parsers do: refuse while bytes are held, and count offsets
+    /// from here.
     fn record_sources(&mut self) -> bool {
+        if !self.buf.is_empty() {
+            return false;
+        }
         self.record = true;
+        self.start = 0;
         true
     }
 
@@ -331,7 +337,9 @@ fn read(text: &str, ranges: &[Range<usize>]) -> Option<String> {
 
 /// The verbatim and tiling rules: each chunk's slot has one entry per choice,
 /// each entry's ranges read back exactly that choice's text, and no input byte
-/// is dated twice.
+/// is dated twice. Ranges need not move forward: a held byte can be released
+/// after a later one. Reading text back cannot tell which occurrence of that
+/// text a range names (see `the_checker_rejects_a_range_from_the_wrong_place`).
 fn check_sources(output: &[Recorded], texts: &HashMap<u32, String>) -> Result<(), String> {
     let mut used: HashMap<u32, Vec<Range<usize>>> = HashMap::new();
     for (position, item) in output.iter().enumerate() {
@@ -537,17 +545,19 @@ fn two_choices_record_separately() {
     assert_recording_is_transparent(&Request::native("glm47"), input);
 }
 
+/// Recording starts after the prompt prefix replays, so a range counts the
+/// generated text only.
 #[test]
 fn the_prompt_prefix_is_not_counted_as_input() {
     let _parser = ParserOverride::install(false);
     let request = Request {
         prefill: StreamPrefill {
             starting_state: UnifiedParserStartingState::Reasoning,
-            prefix: Some("<|channel>"),
+            prefix: Some("<|channel>thought\n"),
         },
         ..Request::native("gemma4")
     };
-    let (input, texts) = with_slots(&split("thought\nR<channel|>A", 3));
+    let (input, texts) = with_slots(&split("R<channel|>A", 3));
     let output = request.run(input);
     check_sources(&output, &texts).unwrap();
     let (mut content, mut reasoning) = (Vec::new(), Vec::new());
@@ -557,8 +567,38 @@ fn the_prompt_prefix_is_not_counted_as_input() {
             reasoning.extend(sources.reasoning.clone());
         }
     }
-    assert_eq!(reasoning, vec![8..9]);
-    assert_eq!(content, vec![19..20]);
+    assert_eq!(reasoning, vec![0..1]);
+    assert_eq!(content, vec![11..12]);
+}
+
+/// A prompt prefix that leaves bytes held refuses recording when the stream
+/// starts, before any generated output. The test parser holds `<|channel>thou`
+/// as a partial opener; had the output disproved it, those prompt bytes would
+/// have surfaced as text with no offset in the generated input.
+#[test]
+fn a_held_prompt_prefix_refuses_before_any_output() {
+    let _parser = ParserOverride::install(false);
+    let request = Request {
+        prefill: StreamPrefill {
+            starting_state: UnifiedParserStartingState::Reasoning,
+            prefix: Some("<|channel>thou"),
+        },
+        ..Request::native("gemma4")
+    };
+    let plain = split("ght\nR<channel|>A", 3);
+    let stock = request.run(plain.clone());
+    assert!(
+        stock.iter().all(|item| !item.is_error()),
+        "recording off must not refuse"
+    );
+    let (input, _) = with_slots(&plain);
+    let output = request.run(input);
+    assert!(output.iter().all(|item| item.data.is_none()), "{output:?}");
+    let error = output.iter().find_map(|item| item.error.as_deref());
+    assert!(
+        error.is_some_and(|error| error.contains("the gemma4 parser cannot record sources")),
+        "{error:?}"
+    );
 }
 
 fn ends_with_error(output: &[Recorded]) -> bool {
@@ -750,14 +790,22 @@ fn the_corpus_records_without_changing_a_chunk() {
         let expected: Vec<_> = request.run(input.clone()).iter().map(plain_key).collect();
         let (slotted, texts) = with_slots(&input);
         let output = request.run(slotted);
-        // The test parser, unlike Gemma's, releases a disproven prompt prefix as
-        // text. Those bytes are prompt, not output, so the adapter refuses them.
+        // A replayed prompt prefix that leaves bytes held refuses to record,
+        // before any generated output: those prompt bytes could surface as
+        // text, and they have no offset in the generated input. Gemma 4 does
+        // this for any prefix short of the whole `<|channel>thought\n` header,
+        // and so does the test parser.
         if name.starts_with("gemma_prefix/")
-            && output
-                .last()
-                .and_then(|item| item.error.as_deref())
-                .is_some_and(|error| error.contains("outside the fed input"))
+            && output.iter().any(|item| {
+                item.error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("cannot record sources"))
+            })
         {
+            assert!(
+                output.iter().all(|item| item.data.is_none()),
+                "{name}: the refusal came after generated output"
+            );
             prefix_refused += 1;
             continue;
         }
@@ -770,7 +818,8 @@ fn the_corpus_records_without_changing_a_chunk() {
     }
     assert!(checked > 1000, "{checked} cases checked");
     assert!(refused > 400, "{refused} guided cases refused");
-    assert!(prefix_refused <= 8, "{prefix_refused} prefix cases refused");
+    // Every corpus prefix ends inside the opener, so the test parser holds it.
+    assert_eq!(prefix_refused, 16, "{prefix_refused} prefix cases refused");
 }
 
 /// The same with the real parsers. It enforces nothing until the
@@ -1300,5 +1349,67 @@ fn disabling_sources_before_usage_flush_refuses_undated_held_text() {
                         .iter()
                         .all(|choice| text_len(choice.delta.content.as_ref()) == 0)
             })
+    );
+}
+
+/// Exact ranges need not move forward through the input: the held `<` is
+/// released after the input reasoning `B` that follows it.
+#[test]
+fn the_checker_accepts_exact_ranges_out_of_input_order() {
+    let _parser = ParserOverride::install(false);
+    let request = Request::native("qwen3");
+    let plain = vec![
+        text_chunk(0, Some("<think><"), None, false),
+        text_chunk(0, Some("C</think>D"), Some("B"), true),
+    ];
+    let stock: Vec<_> = request.run(plain.clone()).iter().map(plain_key).collect();
+    let (input, texts) = with_slots(&plain);
+    let output = request.run(input);
+    assert_eq!(output.iter().map(without_slot).collect::<Vec<_>>(), stock);
+    assert_eq!(&texts[&0], "<think><BC</think>D");
+    let entries: Vec<_> = output
+        .iter()
+        .filter_map(|item| item.data.as_ref())
+        .flat_map(|data| &data.slot)
+        .collect();
+    let reasoning: Vec<_> = entries
+        .iter()
+        .flat_map(|entry| entry.reasoning.iter().cloned())
+        .collect();
+    let content: Vec<_> = entries
+        .iter()
+        .flat_map(|entry| entry.content.iter().cloned())
+        .collect();
+    assert_eq!(reasoning, vec![8..9, 7..8, 9..10]);
+    assert_eq!(content, vec![18..19]);
+    assert_eq!(read(&texts[&0], &reasoning).as_deref(), Some("B<C"));
+    check_sources(&output, &texts).unwrap();
+}
+
+/// A range that reads back the right text from the wrong place: `think` dated
+/// inside the stripped `<think>` opener.
+#[test]
+#[ignore = "the checker reads text back, so it cannot tell which occurrence a range names; needs a per-byte oracle"]
+fn the_checker_rejects_a_range_from_the_wrong_place() {
+    let _parser = ParserOverride::install(false);
+    let (input, texts) = with_slots(&[text_chunk(0, Some("<think>think</think>"), None, true)]);
+    let mut output = Request::native("qwen3").run(input);
+    check_sources(&output, &texts).unwrap();
+    assert_eq!(&texts[&0][1..6], "think");
+    assert_eq!(&texts[&0][7..12], "think");
+    let mut changed = 0;
+    for data in output.iter_mut().filter_map(|item| item.data.as_mut()) {
+        for entry in &mut data.slot {
+            for range in &mut entry.reasoning {
+                assert_eq!(*range, 7..12);
+                *range = 1..6;
+                changed += 1;
+            }
+        }
+    }
+    assert_eq!(changed, 1);
+    assert!(
+        check_sources(&output, &texts).is_err(),
+        "accepted stripped opener 1..6 instead of reasoning 7..12"
     );
 }
