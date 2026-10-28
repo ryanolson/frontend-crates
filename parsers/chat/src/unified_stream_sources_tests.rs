@@ -335,11 +335,14 @@ fn read(text: &str, ranges: &[Range<usize>]) -> Option<String> {
         .map(|parts| parts.concat())
 }
 
-/// The verbatim and tiling rules: each chunk's slot has one entry per choice,
-/// each entry's ranges read back exactly that choice's text, and no input byte
-/// is dated twice.
+/// The verbatim, tiling, and order rules: each chunk's slot has one entry per
+/// choice, each entry's ranges read back exactly that choice's text, each
+/// channel's ranges move forward through the input, and no input byte is dated
+/// twice. Without the order rule, a range could read back the same text from
+/// another place, such as `hink` inside a stripped `<think>`.
 fn check_sources(output: &[Recorded], texts: &HashMap<u32, String>) -> Result<(), String> {
     let mut used: HashMap<u32, Vec<Range<usize>>> = HashMap::new();
+    let mut channel_end: HashMap<(u32, &str), usize> = HashMap::new();
     for (position, item) in output.iter().enumerate() {
         let Some(data) = &item.data else { continue };
         let choices = &data.chunk.inner.choices;
@@ -368,6 +371,15 @@ fn check_sources(output: &[Recorded], texts: &HashMap<u32, String>) -> Result<()
                     return Err(format!(
                         "item {position}: {field} {expected:?} has ranges {ranges:?} over {text:?}"
                     ));
+                }
+                let end = channel_end.entry((choice.index, field)).or_default();
+                for range in ranges {
+                    if range.start < *end {
+                        return Err(format!(
+                            "item {position}: {field} range {range:?} starts before {end}"
+                        ));
+                    }
+                    *end = range.end;
                 }
                 used.entry(choice.index)
                     .or_default()
@@ -541,6 +553,29 @@ fn two_choices_record_separately() {
     input.push(text_chunk(0, Some(""), None, true));
     input.push(text_chunk(1, Some(""), None, true));
     assert_recording_is_transparent(&Request::native("glm47"), input);
+}
+
+/// The checker rejects a range that reads back the right text from the wrong
+/// place: `hink` moved from the reasoning into the stripped `<think>` opener.
+#[test]
+fn the_checker_rejects_a_range_from_the_wrong_place() {
+    let _parser = ParserOverride::install(false);
+    let text = "<think>Think it over.</think>Answer here.";
+    let (input, texts) = with_slots(&split(text, 4));
+    let mut output = Request::native("glm47").run(input);
+    check_sources(&output, &texts).unwrap();
+    assert_eq!(&text[2..6], "hink");
+    let mut moved = 0;
+    for data in output.iter_mut().filter_map(|item| item.data.as_mut()) {
+        for range in data.slot.iter_mut().flat_map(|entry| &mut entry.reasoning) {
+            if *range == (8..12) {
+                *range = 2..6;
+                moved += 1;
+            }
+        }
+    }
+    assert_eq!(moved, 1);
+    assert!(check_sources(&output, &texts).is_err());
 }
 
 /// Recording starts after the prompt prefix replays, so a range counts the
