@@ -122,3 +122,33 @@ fn stream_policies_cost() {
     println!("fold reasoning into content, stock: {fold:.1} ns/chunk");
     println!("force_nonempty_content deferral, stock: {defer:.1} ns/chunk");
 }
+
+/// Instruction counts of the stock deferral, for callgrind: `DEFER_PASSES`
+/// passes (default 1) over the streams, then the chunk count. The difference
+/// of the "Collected" totals at two pass counts, over the extra passes times
+/// the chunk count, is the Ir per chunk with setup cancelled out.
+#[test]
+#[ignore = "instruction count: run under callgrind"]
+fn deferral_passes() {
+    let passes: usize = std::env::var("DEFER_PASSES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let streams = streams();
+    let chunks: usize = streams.iter().map(Vec::len).sum();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    for _ in 0..passes {
+        runtime.block_on(async {
+            for items in &streams {
+                let out: Vec<Item> =
+                    defer_unified_reasoning_for_nonempty_content(stream::iter(items.clone()))
+                        .collect()
+                        .await;
+                std::hint::black_box(out);
+            }
+        });
+    }
+    println!("deferral chunks per pass: {chunks}, passes: {passes}");
+}
