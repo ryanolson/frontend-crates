@@ -9,8 +9,13 @@
 //! parser, to start a unified v2 parser outside reasoning, and to tell the
 //! non-streaming aggregator to keep reasoning out of `reasoning_content`.
 
-use dynamo_parsers::chat_stream::ChatStreamItem;
-use dynamo_protocols::types::{ChatCompletionMessageContent, CreateChatCompletionRequest};
+use std::collections::HashSet;
+
+use dynamo_parsers::chat_stream::{ChatStreamItem, choice_texts};
+use dynamo_parsers::sources::{ChoiceSources, match_choice_sources};
+use dynamo_protocols::types::{
+    ChatChoiceStream, ChatCompletionMessageContent, CreateChatCompletionRequest,
+};
 use dynamo_renderer::request_rules::{
     ChatTemplateArgs, ThinkingRules, has_minimax_m3_constrained_generation, is_minimax_m3_family,
 };
@@ -200,48 +205,74 @@ where
     I: ChatStreamItem,
     S: Stream<Item = I> + Send + 'static,
 {
+    // Choices whose text arrived without ranges, while recording.
+    let mut unsourced: HashSet<u32> = HashSet::new();
     stream.map(move |mut response| {
-        if !reasoning_disabled {
-            return response;
-        }
-        let mut sources = response.sources_mut().map(std::mem::take);
-        // Entries match choices by position among the choices with the same
-        // index, so two choices that share an index each move their own ranges.
-        let mut taken = vec![false; sources.as_ref().map_or(0, Vec::len)];
-        if let Some(data) = response.chunk_mut() {
-            for choice in &mut data.choices {
-                let at = sources.as_ref().and_then(|all| {
-                    (0..all.len()).find(|&at| !taken[at] && all[at].index == choice.index)
-                });
-                if let Some(at) = at {
-                    taken[at] = true;
-                }
-                if let Some(reasoning) = choice.delta.reasoning_content.take() {
-                    let text = match choice.delta.content.take() {
-                        Some(ChatCompletionMessageContent::Text(text)) => text,
-                        None => String::new(),
-                        Some(other) => {
-                            choice.delta.content = Some(other);
-                            choice.delta.reasoning_content = Some(reasoning);
-                            continue;
-                        }
-                    };
-                    choice.delta.content = Some(ChatCompletionMessageContent::Text(format!(
-                        "{reasoning}{text}"
-                    )));
-                    if let Some(entry) = sources.as_mut().zip(at).map(|(all, at)| &mut all[at]) {
-                        let mut content = std::mem::take(&mut entry.reasoning);
-                        content.append(&mut entry.content);
-                        entry.content = content;
-                    }
+        let Some(entries) = response.sources_mut().map(std::mem::take) else {
+            // The stock path: no slot to keep.
+            if reasoning_disabled && let Some(data) = response.chunk_mut() {
+                for choice in &mut data.choices {
+                    fold_choice(choice);
                 }
             }
+            return response;
+        };
+        let texts = response
+            .chunk()
+            .map_or_else(Vec::new, |data| choice_texts(&data.choices));
+        let mut matched = match_choice_sources(entries, &texts);
+        let mut output = Vec::new();
+        if let Some(data) = response.chunk_mut() {
+            for (position, choice) in data.choices.iter_mut().enumerate() {
+                let text = texts[position];
+                let mut entry = matched[position].take();
+                if entry.is_none() && text.content_len + text.reasoning_len > 0 {
+                    unsourced.insert(choice.index);
+                }
+                if unsourced.contains(&choice.index) {
+                    entry = None;
+                } else if entry.is_none() {
+                    // No text needs no ranges.
+                    entry = Some(ChoiceSources {
+                        index: choice.index,
+                        ..ChoiceSources::default()
+                    });
+                }
+                if reasoning_disabled
+                    && fold_choice(choice)
+                    && let Some(entry) = entry.as_mut()
+                {
+                    let mut content = std::mem::take(&mut entry.reasoning);
+                    content.append(&mut entry.content);
+                    entry.content = content;
+                }
+                output.extend(entry);
+            }
         }
-        if let Some(sources) = sources
-            && let Some(slot) = response.sources_mut()
-        {
-            *slot = sources;
+        if let Some(slot) = response.sources_mut() {
+            *slot = output;
         }
         response
     })
+}
+
+/// Folds a choice's reasoning into the front of its text content. Returns
+/// whether it did; a choice with content parts keeps both fields.
+fn fold_choice(choice: &mut ChatChoiceStream) -> bool {
+    let Some(reasoning) = choice.delta.reasoning_content.take() else {
+        return false;
+    };
+    let text = match choice.delta.content.take() {
+        Some(ChatCompletionMessageContent::Text(text)) => text,
+        None => String::new(),
+        Some(other) => {
+            choice.delta.content = Some(other);
+            choice.delta.reasoning_content = Some(reasoning);
+            return false;
+        }
+    };
+    choice.delta.content = Some(ChatCompletionMessageContent::Text(format!(
+        "{reasoning}{text}"
+    )));
+    true
 }

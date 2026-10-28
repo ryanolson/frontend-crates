@@ -439,7 +439,6 @@ async fn review_f1_fold_dates_each_duplicate_choice_entry() {
 }
 
 #[tokio::test]
-#[ignore = "F5: a contentless duplicate consumes the following choice's source entry"]
 async fn review_f5_contentless_duplicate_does_not_steal_policy_sources() {
     let mut violations = Vec::new();
     for (name, policy) in [("fold", fold as Policy), ("defer", defer as Policy)] {
@@ -505,7 +504,6 @@ async fn review_f5_contentless_duplicate_does_not_steal_policy_sources() {
 }
 
 #[tokio::test]
-#[ignore = "F6: the reasoning-off fold resumes source entries after a text gap"]
 async fn review_f6_fold_keeps_a_choice_unsourced_after_a_gap() {
     let mut violations = Vec::new();
     for (label, first_delta) in [
