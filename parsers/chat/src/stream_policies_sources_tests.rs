@@ -413,7 +413,6 @@ async fn text_without_ranges_gets_no_entry() {
 }
 
 #[tokio::test]
-#[ignore = "F1: the fold rewrites the first source entry twice for duplicate choice indices"]
 async fn review_f1_fold_dates_each_duplicate_choice_entry() {
     let chunks = vec![chunk(vec![
         json!({"index": 0, "delta": {"reasoning_content": "R", "content": "A"}}),

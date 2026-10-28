@@ -205,8 +205,17 @@ where
             return response;
         }
         let mut sources = response.sources_mut().map(std::mem::take);
+        // Entries match choices by position among the choices with the same
+        // index, so two choices that share an index each move their own ranges.
+        let mut taken = vec![false; sources.as_ref().map_or(0, Vec::len)];
         if let Some(data) = response.chunk_mut() {
             for choice in &mut data.choices {
+                let at = sources.as_ref().and_then(|all| {
+                    (0..all.len()).find(|&at| !taken[at] && all[at].index == choice.index)
+                });
+                if let Some(at) = at {
+                    taken[at] = true;
+                }
                 if let Some(reasoning) = choice.delta.reasoning_content.take() {
                     let text = match choice.delta.content.take() {
                         Some(ChatCompletionMessageContent::Text(text)) => text,
@@ -220,10 +229,7 @@ where
                     choice.delta.content = Some(ChatCompletionMessageContent::Text(format!(
                         "{reasoning}{text}"
                     )));
-                    if let Some(entry) = sources
-                        .as_mut()
-                        .and_then(|all| all.iter_mut().find(|entry| entry.index == choice.index))
-                    {
+                    if let Some(entry) = sources.as_mut().zip(at).map(|(all, at)| &mut all[at]) {
                         let mut content = std::mem::take(&mut entry.reasoning);
                         content.append(&mut entry.content);
                         entry.content = content;
