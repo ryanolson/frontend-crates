@@ -82,7 +82,8 @@ pub fn choice_texts(choices: &[ChatChoiceStream]) -> Vec<ChoiceText> {
     choices.iter().map(choice_text).collect()
 }
 
-fn choice_text(choice: &ChatChoiceStream) -> ChoiceText {
+/// The text lengths of one choice; see [`choice_texts`].
+pub fn choice_text(choice: &ChatChoiceStream) -> ChoiceText {
     ChoiceText {
         index: choice.index,
         content_len: match &choice.delta.content {
