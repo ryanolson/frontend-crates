@@ -18,6 +18,7 @@
 // at that point the jail-and-batch mechanism and this whole v1 crate are removed.
 
 pub mod annotated;
+mod boundary;
 mod guided_stream;
 use guided_stream::{GuidedDelta, GuidedStreamCursor};
 mod prefix_matcher;
@@ -40,6 +41,7 @@ use dynamo_protocols::types::{
 use futures::{Stream, StreamExt};
 use serde_json::value::RawValue;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use uuid::Uuid;
 
 use crate::tool_calling::config::{JsonParserConfig, ParserConfig, TerminalMarkerPolicy};
@@ -49,11 +51,39 @@ use crate::tool_calling::json::{JsonParserType, try_tool_call_parse_basic_json};
 use crate::tool_calling::parsers::get_tool_parser_map;
 use crate::tool_calling::{
     ToolCallResponse, detect_tool_call_start, find_tool_call_end_position,
-    try_tool_call_parse_aggregate, try_tool_call_parse_aggregate_finalize,
+    try_tool_call_parse_aggregate,
 };
 
 pub use self::annotated::Annotated;
+pub use self::boundary::{
+    JailChoiceCountError, apply_jail_terminal_error_contract, validate_jail_nvext_choice_count,
+};
 use self::prefix_matcher::{MarkerMatcher, MatchResult};
+use crate::chat_stream::{SourcedChunk, choice_texts};
+use crate::sources::{ChoiceSources, SourcedText, Spans, match_choice_sources};
+use crate::tool_calling::parsers::{
+    detect_and_parse_tool_call_sourced, detect_and_parse_tool_call_with_recovery_sourced,
+};
+
+#[cfg(test)]
+mod sources_tests;
+
+/// Drops the source entries of choices whose text arrived without ranges.
+fn drop_unsourced(unsourced: &HashSet<u32>, item: &mut SourcedItem) {
+    if !unsourced.is_empty()
+        && let Some(sources) = item.1.as_mut()
+    {
+        sources.retain(|entry| !unsourced.contains(&entry.index));
+    }
+}
+
+/// A jail stream item with, while recording, the input ranges of each choice's
+/// text. Ranges are in the caller's offsets when the input item carries them,
+/// else in offsets over the text each choice received.
+pub(crate) type SourcedItem = (
+    Annotated<CreateChatCompletionStreamResponse>,
+    Option<Vec<ChoiceSources>>,
+);
 
 fn is_harmony_parser(parser: Option<&str>) -> bool {
     parser == Some("harmony")
@@ -133,17 +163,50 @@ fn append_logprobs(target: &mut Option<ChatChoiceLogprobs>, extra: Option<ChatCh
 /// Pack emissions into frames that hold each choice index at most once, in
 /// emission order. A same-index entry folds into the current frame when that
 /// loses nothing and crosses no boundary; otherwise it opens the next frame.
-fn pack_choices(emissions: Vec<ChoiceEmission>) -> Vec<Vec<ChatChoiceStream>> {
+///
+/// While recording, the second result holds each frame's sources, one per
+/// choice in the same order. It is `None` when no emission records.
+fn pack_choices(
+    emissions: Vec<Emitted>,
+) -> (Vec<Vec<ChatChoiceStream>>, Option<Vec<Vec<ChoiceSources>>>) {
     let mut frames: Vec<Vec<ChatChoiceStream>> = vec![Vec::new()];
-    for choice in emissions.into_iter().map(ChoiceEmission::into_choice) {
+    let mut sources: Option<Vec<Vec<ChoiceSources>>> = None;
+    for emitted in emissions {
+        let (choice, choice_sources) = emitted.into_parts();
+        if choice_sources.is_some() && sources.is_none() {
+            debug_assert!(
+                frames.len() == 1 && frames[0].is_empty(),
+                "every emission records, or none does"
+            );
+            sources = Some(vec![Vec::new()]);
+        }
         let frame = frames.last_mut().expect("frames is never empty");
-        match frame.iter_mut().find(|seen| seen.index == choice.index) {
-            None => frame.push(choice),
-            Some(seen) if choices_merge(seen, &choice) => merge_choice(seen, choice),
-            Some(_) => frames.push(vec![choice]),
+        match frame.iter().position(|seen| seen.index == choice.index) {
+            None => {
+                frame.push(choice);
+                if let (Some(all), Some(choice_sources)) = (sources.as_mut(), choice_sources) {
+                    all.last_mut()
+                        .expect("one list per frame")
+                        .push(choice_sources);
+                }
+            }
+            Some(at) if choices_merge(&frame[at], &choice) => {
+                merge_choice(&mut frame[at], choice);
+                if let (Some(all), Some(more)) = (sources.as_mut(), choice_sources) {
+                    let seen = &mut all.last_mut().expect("one list per frame")[at];
+                    seen.content.extend(more.content);
+                    seen.reasoning.extend(more.reasoning);
+                }
+            }
+            Some(_) => {
+                frames.push(vec![choice]);
+                if let (Some(all), Some(choice_sources)) = (sources.as_mut(), choice_sources) {
+                    all.push(vec![choice_sources]);
+                }
+            }
         }
     }
-    frames
+    (frames, sources)
 }
 
 /// Whether two entries for one choice fold without losing anything or
@@ -305,6 +368,109 @@ impl ChoiceEmission {
     }
 }
 
+/// An emission with, while recording, the input ranges of its content and
+/// its reasoning. Every edit to the emission's text edits these too, so they
+/// travel together. The ranges sit behind a box in the niche of
+/// `ChoiceEmission`, so with recording off this type is exactly as large as
+/// the emission and the stock path moves no extra bytes.
+// Boxing `Plain` would add an allocation per emission on the stock path.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+enum Emitted {
+    Plain(ChoiceEmission),
+    Sourced(Box<(ChoiceEmission, EmittedSpans)>),
+}
+
+#[derive(Debug, Clone)]
+struct EmittedSpans {
+    content: Spans,
+    reasoning: Spans,
+}
+
+impl Emitted {
+    fn new(emission: ChoiceEmission, content: Spans) -> Self {
+        if content.is_recording() {
+            let reasoning = Spans::recording(true);
+            Self::Sourced(Box::new((emission, EmittedSpans { content, reasoning })))
+        } else {
+            Self::Plain(emission)
+        }
+    }
+
+    fn emission(&self) -> &ChoiceEmission {
+        match self {
+            Self::Plain(emission) => emission,
+            Self::Sourced(sourced) => &sourced.0,
+        }
+    }
+
+    /// The emission, and its sources while recording.
+    fn parts_mut(&mut self) -> (&mut ChoiceEmission, Option<&mut EmittedSpans>) {
+        match self {
+            Self::Plain(emission) => (emission, None),
+            Self::Sourced(sourced) => {
+                let (emission, spans) = &mut **sourced;
+                (emission, Some(spans))
+            }
+        }
+    }
+
+    /// Sets the sources of the reasoning; a no-op while not recording.
+    fn set_reasoning(&mut self, reasoning: Spans) {
+        if let (_, Some(spans)) = self.parts_mut() {
+            spans.reasoning = reasoning;
+        }
+    }
+
+    fn choice(&self) -> &ChatChoiceStream {
+        self.emission().choice()
+    }
+
+    fn choice_mut(&mut self) -> &mut ChatChoiceStream {
+        self.parts_mut().0.choice_mut()
+    }
+
+    fn is_whitespace_only_content(&self) -> bool {
+        self.emission().is_whitespace_only_content()
+    }
+
+    /// The choice, and its sources while recording.
+    fn into_parts(self) -> (ChatChoiceStream, Option<ChoiceSources>) {
+        match self {
+            Self::Plain(emission) => (emission.into_choice(), None),
+            Self::Sourced(sourced) => {
+                let (emission, spans) = *sourced;
+                let choice = emission.into_choice();
+                let sources = ChoiceSources {
+                    index: choice.index,
+                    content: spans.content.into_ranges(),
+                    reasoning: spans.reasoning.into_ranges(),
+                };
+                (choice, Some(sources))
+            }
+        }
+    }
+}
+
+impl From<ChoiceEmission> for Emitted {
+    fn from(emission: ChoiceEmission) -> Self {
+        Self::Plain(emission)
+    }
+}
+
+impl std::ops::Deref for Emitted {
+    type Target = ChatChoiceStream;
+    fn deref(&self) -> &ChatChoiceStream {
+        self.choice()
+    }
+}
+
+impl std::ops::DerefMut for Emitted {
+    fn deref_mut(&mut self) -> &mut ChatChoiceStream {
+        self.choice_mut()
+    }
+}
+
 /// Configuration for jail detection and parsing
 #[derive(Debug, Clone)]
 pub struct JailConfig<'a> {
@@ -389,6 +555,18 @@ struct ChoiceJailState {
     /// grammar the payload's shape is already known, so calls can be released as
     /// they arrive instead of at the closing brace.
     guided_cursor: Option<GuidedStreamCursor>,
+    /// Whether this choice records the input ranges of its text. The spans
+    /// below are [`Spans::OFF`] when it does not, and every edit is a no-op.
+    record: bool,
+    /// Offsets over this choice's own text, for input items without ranges.
+    content_fed: usize,
+    reasoning_fed: usize,
+    /// Sources of `accumulated_content`, `partial_match_buffer`,
+    /// `terminal_suffix_buffer`, and `pending_reasoning_content`.
+    accumulated_spans: Spans,
+    partial_spans: Spans,
+    terminal_suffix_spans: Spans,
+    pending_reasoning_spans: Spans,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -529,7 +707,9 @@ impl JsonCompletionProgress {
     }
 }
 
-type ParsedToolCalls = (Vec<ToolCallResponse>, Option<String>);
+/// Parsed calls and the parser's normal text, with its ranges in the parsed
+/// text while recording.
+type ParsedToolCalls = (Vec<ToolCallResponse>, Option<SourcedText>);
 type MarkerParseResult = anyhow::Result<ParsedToolCalls>;
 
 #[derive(Debug, Clone)]
@@ -707,7 +887,63 @@ impl ChoiceJailState {
             pending_reasoning_content: None,
             completion_progress: JailCompletionProgress::default(),
             guided_cursor: guided.map(GuidedStreamCursor::new),
+            record: false,
+            content_fed: 0,
+            reasoning_fed: 0,
+            accumulated_spans: Spans::OFF,
+            partial_spans: Spans::OFF,
+            terminal_suffix_spans: Spans::OFF,
+            pending_reasoning_spans: Spans::OFF,
         }
+    }
+
+    /// Records the sources of this choice's text from here on. Called on a new
+    /// state, before it holds any text.
+    fn start_recording(&mut self) {
+        self.record = true;
+        for spans in [
+            &mut self.accumulated_spans,
+            &mut self.partial_spans,
+            &mut self.terminal_suffix_spans,
+            &mut self.pending_reasoning_spans,
+        ] {
+            *spans = Spans::recording(true);
+        }
+    }
+
+    /// Empty ranges that record when this choice does.
+    fn no_spans(&self) -> Spans {
+        Spans::recording(self.record)
+    }
+
+    /// The sources of an input text: the caller's, or this choice's own offsets.
+    fn input_spans(
+        &mut self,
+        text: &str,
+        given: Option<&[Range<usize>]>,
+        reasoning: bool,
+    ) -> Spans {
+        if !self.record {
+            return Spans::OFF;
+        }
+        let fed = if reasoning {
+            &mut self.reasoning_fed
+        } else {
+            &mut self.content_fed
+        };
+        let start = *fed;
+        *fed += text.len();
+        let mut spans = Spans::recording(true);
+        match given {
+            Some(ranges) => {
+                for range in ranges {
+                    spans.push(range.clone());
+                }
+                debug_assert_eq!(spans.len(), text.len(), "input ranges must tile the text");
+            }
+            None => spans.push(start..start + text.len()),
+        }
+        spans
     }
 
     /// Append a chunk's logprob entries to the pending pool. Every arm
@@ -761,18 +997,20 @@ impl ChoiceJailState {
         logprobs
     }
 
-    fn begin_jail(&mut self, content: String, logprobs: Option<ChatChoiceLogprobs>) {
+    fn begin_jail(&mut self, content: String, spans: Spans, logprobs: Option<ChatChoiceLogprobs>) {
         self.is_jailed = true;
         self.accumulated_content = content;
+        self.accumulated_spans = spans;
         self.accumulated_logprobs = logprobs;
         self.held_after_contentless.clear();
         self.completion_progress.reset();
     }
 
     /// Add content and logprobs to this choice's accumulation
-    fn accumulate(&mut self, content: &str, logprobs: Option<&ChatChoiceLogprobs>) {
+    fn accumulate(&mut self, content: &str, spans: &Spans, logprobs: Option<&ChatChoiceLogprobs>) {
         if self.is_jailed {
             self.accumulated_content.push_str(content);
+            self.accumulated_spans.append(spans);
             // Accumulate logprobs so they are preserved across jailed chunks.
             append_logprobs(&mut self.accumulated_logprobs, logprobs.cloned());
         }
@@ -816,8 +1054,9 @@ impl ChoiceJailState {
     ///
     /// A backend chunk can contain both pieces. Emit them separately so clients
     /// always receive the reasoning first.
-    fn take_pending_reasoning_emission(&mut self) -> Option<ChoiceEmission> {
+    fn take_pending_reasoning_emission(&mut self) -> Option<Emitted> {
         let reasoning_content = self.pending_reasoning_content.take()?;
+        let reasoning = self.pending_reasoning_spans.take();
         #[allow(deprecated)]
         let choice = ChatChoiceStream {
             index: self.index,
@@ -832,11 +1071,14 @@ impl ChoiceJailState {
             finish_reason: None,
             logprobs: None,
         };
-        Some(ChoiceEmission::PassThrough(choice))
+        let mut emitted = Emitted::new(ChoiceEmission::PassThrough(choice), self.no_spans());
+        emitted.set_reasoning(reasoning);
+        Some(emitted)
     }
 
     /// End jailing and return the accumulated content
     fn end_jail(&mut self) -> String {
+        self.accumulated_spans.clear();
         self.is_jailed = false;
         self.accumulated_logprobs = None;
         self.held_after_contentless.clear();
@@ -860,7 +1102,7 @@ impl ChoiceJailState {
         &self,
         choice: &ChatChoiceStream,
         had_tool_calls_before: bool,
-        emissions: &mut Vec<ChoiceEmission>,
+        emissions: &mut Vec<Emitted>,
     ) {
         let Some(finish_reason) = choice.finish_reason else {
             return;
@@ -912,7 +1154,10 @@ impl ChoiceJailState {
                 finish_reason: Some(finish_reason),
                 logprobs: None,
             };
-            emissions.push(ChoiceEmission::PassThrough(terminal_choice));
+            emissions.push(Emitted::new(
+                ChoiceEmission::PassThrough(terminal_choice),
+                self.no_spans(),
+            ));
             return;
         }
 
@@ -926,10 +1171,11 @@ impl ChoiceJailState {
     fn handle_trailing_content(
         &mut self,
         content: &str,
+        spans: Spans,
         choice: &ChatChoiceStream,
         logprobs: Option<ChatChoiceLogprobs>,
         jail_stream: &JailedStream,
-        emissions: &mut Vec<ChoiceEmission>,
+        emissions: &mut Vec<Emitted>,
     ) {
         if content.is_empty() {
             return;
@@ -944,6 +1190,7 @@ impl ChoiceJailState {
         // combined text, so a second consecutive short-suffix chunk cannot
         // discard the first hold's text.
         let held_text;
+        let mut spans = spans;
         let content = if self.partial_match_buffer.is_empty() {
             content
         } else {
@@ -952,6 +1199,7 @@ impl ChoiceJailState {
                 std::mem::take(&mut self.partial_match_buffer),
                 content
             );
+            spans.prepend(self.partial_spans.take());
             &held_text
         };
 
@@ -961,6 +1209,9 @@ impl ChoiceJailState {
             MatchResult::Partial {
                 prefix, partial, ..
             } => {
+                debug_assert!(
+                    !spans.is_recording() || prefix.len() + partial.len() == content.len()
+                );
                 if !prefix.is_empty() {
                     let prefix_lp = self.consume_pending_entries(prefix.chars().count());
                     #[allow(deprecated)]
@@ -972,8 +1223,13 @@ impl ChoiceJailState {
                         None,
                         prefix_lp,
                     );
-                    emissions.push(ChoiceEmission::Trailing(trailing_choice));
+                    let prefix_spans = spans.slice(0..prefix.len());
+                    emissions.push(Emitted::new(
+                        ChoiceEmission::Trailing(trailing_choice),
+                        prefix_spans,
+                    ));
                 }
+                self.partial_spans = spans.slice(prefix.len()..content.len());
                 self.partial_match_buffer = partial;
                 return;
             }
@@ -988,11 +1244,15 @@ impl ChoiceJailState {
                 suffix,
                 ..
             } => {
+                debug_assert!(
+                    !spans.is_recording()
+                        || prefix.len() + marker.len() + suffix.len() == content.len()
+                );
                 let prefix_has_harmony_protocol =
                     is_harmony_parser(jail_stream.tool_call_parser.as_deref())
                         && contains_harmony_protocol(&prefix);
-                let jailed = if prefix_has_harmony_protocol {
-                    format!("{prefix}{marker}{suffix}")
+                let (jailed, jailed_spans) = if prefix_has_harmony_protocol {
+                    (format!("{prefix}{marker}{suffix}"), spans)
                 } else {
                     if !prefix.is_empty() {
                         let prefix_lp = self.consume_pending_entries(prefix.chars().count());
@@ -1005,12 +1265,17 @@ impl ChoiceJailState {
                             None,
                             prefix_lp,
                         );
-                        emissions.push(ChoiceEmission::Trailing(trailing_choice));
+                        let prefix_spans = spans.slice(0..prefix.len());
+                        emissions.push(Emitted::new(
+                            ChoiceEmission::Trailing(trailing_choice),
+                            prefix_spans,
+                        ));
                     }
-                    format!("{marker}{suffix}")
+                    let rest = spans.slice(prefix.len()..content.len());
+                    (format!("{marker}{suffix}"), rest)
                 };
                 let remaining = self.take_held_entries();
-                self.begin_jail(jailed, remaining);
+                self.begin_jail(jailed, jailed_spans, remaining);
                 return;
             }
             MatchResult::None { .. } => {}
@@ -1028,12 +1293,18 @@ impl ChoiceJailState {
                     None,
                     prefix_lp,
                 );
-                emissions.push(ChoiceEmission::Trailing(trailing_choice));
+                let prefix_spans = spans.slice(0..prefix.len());
+                emissions.push(Emitted::new(
+                    ChoiceEmission::Trailing(trailing_choice),
+                    prefix_spans,
+                ));
             }
+            // The splitters cut `content` at one index into `prefix` and `partial`.
+            self.partial_spans = spans.slice(prefix.len()..content.len());
             self.partial_match_buffer = partial.to_string();
         } else if jail_stream.should_start_jail(content) {
             let remaining = self.take_held_entries();
-            self.begin_jail(content.to_string(), remaining);
+            self.begin_jail(content.to_string(), spans, remaining);
         } else {
             let all = self.take_held_entries();
             #[allow(deprecated)]
@@ -1045,7 +1316,10 @@ impl ChoiceJailState {
                 choice.finish_reason,
                 all,
             );
-            emissions.push(ChoiceEmission::Trailing(trailing_choice));
+            emissions.push(Emitted::new(
+                ChoiceEmission::Trailing(trailing_choice),
+                spans,
+            ));
         }
     }
 
@@ -1057,11 +1331,7 @@ impl ChoiceJailState {
     /// The cursor records every byte it releases, so the completion path can emit
     /// only the remainder. A fragment cannot be unsaid, so the cursor is the single
     /// owner of what the client has already seen.
-    fn emit_guided_progress(
-        &mut self,
-        choice: &ChatChoiceStream,
-        emissions: &mut Vec<ChoiceEmission>,
-    ) {
+    fn emit_guided_progress(&mut self, choice: &ChatChoiceStream, emissions: &mut Vec<Emitted>) {
         let Some(cursor) = self.guided_cursor.as_mut() else {
             return;
         };
@@ -1102,14 +1372,18 @@ impl ChoiceJailState {
             });
         }
 
-        emissions.push(ChoiceEmission::ToolCall(create_choice_stream(
+        let call = create_choice_stream(
             choice.index,
             choice.delta.role,
             "",
             Some(chunks),
             None,
             None,
-        )));
+        );
+        emissions.push(Emitted::new(
+            ChoiceEmission::ToolCall(call),
+            self.no_spans(),
+        ));
     }
 
     /// Reconcile a rebuilt choice against what the cursor already streamed.
@@ -1212,18 +1486,21 @@ impl ChoiceJailState {
         completed: CompletedJail,
         choice: &ChatChoiceStream,
         jail_stream: &JailedStream,
-        emissions: &mut Vec<ChoiceEmission>,
+        emissions: &mut Vec<Emitted>,
     ) {
         let split_pos = completed.split_pos.min(self.accumulated_content.len());
         let (jailed_part, trailing_part) = self.accumulated_content.split_at(split_pos);
         let jailed_owned = jailed_part.to_string();
         let trailing_owned = trailing_part.to_string();
+        let mut jailed_spans = self.accumulated_spans.take();
+        let trailing_spans = jailed_spans.split_off(split_pos);
         let jail_logprobs = self.take_accumulated_logprobs();
 
-        let mut unjailed_choice = jail_stream
+        let (mut unjailed_choice, content_spans) = jail_stream
             .create_tool_call_choice(
                 choice.index,
                 &jailed_owned,
+                &jailed_spans,
                 choice,
                 self.emitted_tool_calls_count,
                 false,
@@ -1237,14 +1514,27 @@ impl ChoiceJailState {
         self.reconcile_streamed_calls(&mut unjailed_choice);
 
         if unjailed_choice.delta.tool_calls.is_some() {
-            emissions.push(ChoiceEmission::ToolCall(unjailed_choice));
+            emissions.push(Emitted::new(
+                ChoiceEmission::ToolCall(unjailed_choice),
+                content_spans,
+            ));
         } else {
-            emissions.push(ChoiceEmission::Content(unjailed_choice));
+            emissions.push(Emitted::new(
+                ChoiceEmission::Content(unjailed_choice),
+                content_spans,
+            ));
         }
 
         self.end_jail();
         // The jail emission above already carries this chunk's logprob records.
-        self.handle_trailing_content(&trailing_owned, choice, None, jail_stream, emissions);
+        self.handle_trailing_content(
+            &trailing_owned,
+            trailing_spans,
+            choice,
+            None,
+            jail_stream,
+            emissions,
+        );
     }
 
     /// Process incoming content and return what should be emitted (if anything)
@@ -1252,14 +1542,18 @@ impl ChoiceJailState {
         &mut self,
         choice: &ChatChoiceStream,
         content: &str,
+        spans: Spans,
         jail_stream: &JailedStream,
-    ) -> Vec<ChoiceEmission> {
+    ) -> Vec<Emitted> {
         let mut emissions = Vec::new();
         if !self.is_jailed {
             // Use the marker matcher to detect complete/partial markers
             let match_result = jail_stream
                 .marker_matcher
                 .process_chunk(content, &self.partial_match_buffer);
+            // The matcher joins the held partial and this chunk; so do their sources.
+            let mut combined = self.partial_spans.take();
+            combined.append(&spans);
 
             let unresolved_marker = !self.held_after_contentless.is_empty()
                 && matches!(&match_result, MatchResult::Partial { prefix, partial, .. }
@@ -1281,7 +1575,10 @@ impl ChoiceJailState {
                         self.release_held_entries(),
                     );
                     records.delta.content = None;
-                    emissions.push(ChoiceEmission::PassThrough(records));
+                    emissions.push(Emitted::new(
+                        ChoiceEmission::PassThrough(records),
+                        self.no_spans(),
+                    ));
                 }
                 self.feed_entries(choice.logprobs.clone());
             }
@@ -1296,6 +1593,7 @@ impl ChoiceJailState {
                     let prefix_has_harmony_protocol =
                         is_harmony_parser(jail_stream.tool_call_parser.as_deref())
                             && contains_harmony_protocol(&prefix);
+                    let total = prefix.len() + marker.len() + suffix.len();
 
                     // Emit prefix if any
                     if !prefix.is_empty() && !prefix_has_harmony_protocol {
@@ -1309,18 +1607,23 @@ impl ChoiceJailState {
                             choice.finish_reason,
                             prefix_lp,
                         );
-                        emissions.push(ChoiceEmission::PassThrough(prefix_choice));
+                        let prefix_spans = combined.slice(0..prefix.len());
+                        emissions.push(Emitted::new(
+                            ChoiceEmission::PassThrough(prefix_choice),
+                            prefix_spans,
+                        ));
                     }
 
                     // Build the potential full content
-                    let full_content = if prefix_has_harmony_protocol {
-                        format!("{}{}{}", prefix, marker, suffix)
+                    let (full_content, full_spans) = if prefix_has_harmony_protocol {
+                        (format!("{}{}{}", prefix, marker, suffix), combined)
                     } else {
-                        format!("{}{}", marker, suffix)
+                        let rest = combined.slice(prefix.len()..total);
+                        (format!("{}{}", marker, suffix), rest)
                     };
 
                     let remaining = self.take_held_entries();
-                    self.begin_jail(full_content, remaining);
+                    self.begin_jail(full_content, full_spans, remaining);
                     let completion = jail_stream
                         .check_jail_completion(
                             &self.accumulated_content,
@@ -1344,7 +1647,7 @@ impl ChoiceJailState {
                         && contains_harmony_protocol(&prefix)
                     {
                         let remaining = self.take_held_entries();
-                        self.begin_jail(format!("{}{}", prefix, partial), remaining);
+                        self.begin_jail(format!("{}{}", prefix, partial), combined, remaining);
                         self.partial_match_buffer.clear();
                         return emissions;
                     }
@@ -1361,10 +1664,15 @@ impl ChoiceJailState {
                             choice.finish_reason,
                             prefix_lp,
                         );
-                        emissions.push(ChoiceEmission::PassThrough(prefix_choice));
+                        let prefix_spans = combined.slice(0..prefix.len());
+                        emissions.push(Emitted::new(
+                            ChoiceEmission::PassThrough(prefix_choice),
+                            prefix_spans,
+                        ));
                     }
 
                     // Hold the partial for next chunk
+                    self.partial_spans = combined.slice(prefix.len()..prefix.len() + partial.len());
                     self.partial_match_buffer = partial;
 
                     tracing::trace!(
@@ -1390,12 +1698,18 @@ impl ChoiceJailState {
                                 None,
                                 prefix_lp,
                             );
-                            emissions.push(ChoiceEmission::PassThrough(prefix_choice));
+                            let prefix_spans = combined.slice(0..prefix.len());
+                            emissions.push(Emitted::new(
+                                ChoiceEmission::PassThrough(prefix_choice),
+                                prefix_spans,
+                            ));
                         }
+                        // The splitters cut `content` at one index into `prefix` and `partial`.
+                        self.partial_spans = combined.slice(prefix.len()..content.len());
                         self.partial_match_buffer = partial.to_string();
                     } else if jail_stream.should_start_jail(&content) {
                         let remaining = self.take_held_entries();
-                        self.begin_jail(content, remaining);
+                        self.begin_jail(content, combined, remaining);
                         self.partial_match_buffer.clear();
                     } else {
                         // No markers - emit everything
@@ -1413,7 +1727,10 @@ impl ChoiceJailState {
                                 choice.finish_reason,
                                 all,
                             );
-                            emissions.push(ChoiceEmission::PassThrough(pass_through_choice));
+                            emissions.push(Emitted::new(
+                                ChoiceEmission::PassThrough(pass_through_choice),
+                                combined,
+                            ));
                         }
                         self.partial_match_buffer.clear();
                     }
@@ -1421,7 +1738,7 @@ impl ChoiceJailState {
             }
         } else {
             // Already jailed - accumulate content AND logprobs, then check for unjail
-            self.accumulate(content, choice.logprobs.as_ref());
+            self.accumulate(content, &spans, choice.logprobs.as_ref());
 
             // Under a guided grammar the payload's shape is already fixed, so release
             // whatever the cursor can commit to BEFORE the completion check. Holding a
@@ -1441,8 +1758,9 @@ impl ChoiceJailState {
         emissions
     }
 
-    fn take_terminal_suffix_emission(&mut self, finish: Option<FinishReason>) -> ChoiceEmission {
+    fn take_terminal_suffix_emission(&mut self, finish: Option<FinishReason>) -> Emitted {
         let text = std::mem::take(&mut self.terminal_suffix_buffer);
+        let spans = self.terminal_suffix_spans.take();
         let tokens = std::mem::take(&mut self.terminal_suffix_logprobs);
         let mut choice = create_choice_stream(
             self.index,
@@ -1458,7 +1776,7 @@ impl ChoiceJailState {
         if text.is_empty() {
             choice.delta.content = None;
         }
-        ChoiceEmission::Content(choice)
+        Emitted::new(ChoiceEmission::Content(choice), spans)
     }
 
     fn suffix_logprob_boundary(
@@ -1478,11 +1796,7 @@ impl ChoiceJailState {
 
     /// Hold a possible configured terminal suffix until more text disambiguates it.
     /// Tool arguments never enter this content-only filter.
-    fn hold_terminal_suffix(
-        &mut self,
-        emissions: &mut Vec<ChoiceEmission>,
-        policy: TerminalMarkerPolicy,
-    ) {
+    fn hold_terminal_suffix(&mut self, emissions: &mut Vec<Emitted>, policy: TerminalMarkerPolicy) {
         let suffixes = policy.orphan_end_suffixes;
         if suffixes.is_empty() {
             return;
@@ -1505,7 +1819,8 @@ impl ChoiceJailState {
                 index += 1;
                 continue;
             }
-            let choice = emissions[index].choice_mut();
+            let (emission, mut spans) = emissions[index].parts_mut();
+            let choice = emission.choice_mut();
             let Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(text)) =
                 choice.delta.content.as_mut()
             else {
@@ -1514,6 +1829,9 @@ impl ChoiceJailState {
             };
             if !self.terminal_suffix_buffer.is_empty() {
                 text.insert_str(0, &std::mem::take(&mut self.terminal_suffix_buffer));
+                if let Some(spans) = spans.as_mut() {
+                    spans.content.prepend(self.terminal_suffix_spans.take());
+                }
                 if !self.terminal_suffix_logprobs.is_empty() {
                     let mut tokens = std::mem::take(&mut self.terminal_suffix_logprobs);
                     let logprobs = choice.logprobs.get_or_insert(ChatChoiceLogprobs {
@@ -1561,6 +1879,9 @@ impl ChoiceJailState {
                         choice.logprobs = None;
                     }
                 }
+                self.terminal_suffix_spans = spans.as_mut().map_or(Spans::OFF, |spans| {
+                    spans.content.split_off(text.len() - suffix_len)
+                });
                 self.terminal_suffix_buffer = text.split_off(text.len() - suffix_len);
                 if text.is_empty() {
                     choice.delta.content = None;
@@ -1583,7 +1904,7 @@ impl ChoiceJailState {
     }
 
     /// Finalize any remaining content when stream ends
-    async fn finalize(&mut self, jail_stream: &JailedStream) -> Vec<ChoiceEmission> {
+    async fn finalize(&mut self, jail_stream: &JailedStream) -> Vec<Emitted> {
         let policy = jail_stream.terminal_marker_policy;
         let emission = if self.is_jailed && !self.accumulated_content.is_empty() {
             // Create a dummy choice for the method call
@@ -1597,10 +1918,11 @@ impl ChoiceJailState {
                 self.accumulated_logprobs.clone(),
             );
 
-            let mut final_choice = jail_stream
+            let (mut final_choice, content_spans) = jail_stream
                 .create_tool_call_choice(
                     self.index,
                     &self.accumulated_content,
+                    &self.accumulated_spans,
                     &dummy_choice,
                     self.emitted_tool_calls_count,
                     true, // finalize: enable EOF recovery for missing-end-token / truncated-JSON
@@ -1615,7 +1937,10 @@ impl ChoiceJailState {
             self.reconcile_streamed_calls(&mut final_choice);
 
             // Preserve any pending reasoning content collected while jailed.
+            // The rebuilt choice carries no reasoning of its own.
+            let mut reasoning_spans = self.no_spans();
             if let Some(pending_reasoning) = self.pending_reasoning_content.take() {
+                reasoning_spans.append(&self.pending_reasoning_spans.take());
                 if let Some(existing_reasoning) = final_choice.delta.reasoning_content.as_mut() {
                     existing_reasoning.push_str(&pending_reasoning);
                 } else {
@@ -1627,19 +1952,24 @@ impl ChoiceJailState {
             self.end_jail();
 
             // Determine emission type
-            if final_choice.delta.tool_calls.is_some() {
-                Some(ChoiceEmission::ToolCall(final_choice))
+            let emission = if final_choice.delta.tool_calls.is_some() {
+                ChoiceEmission::ToolCall(final_choice)
             } else {
-                Some(ChoiceEmission::Content(final_choice))
-            }
+                ChoiceEmission::Content(final_choice)
+            };
+            let mut emitted = Emitted::new(emission, content_spans);
+            emitted.set_reasoning(reasoning_spans);
+            Some(emitted)
         } else if !self.partial_match_buffer.is_empty() {
             let suppress_marker = self.stream_finish_reason == Some(FinishReason::Length)
                 && self.has_reserved_partial_marker(policy);
             let mut content = std::mem::take(&mut self.partial_match_buffer);
+            let mut content_spans = self.partial_spans.take();
             let logprobs = if suppress_marker {
                 // The limit interrupted a reserved close marker, not prose.
                 // Still emit its terminal chunk with the original finish reason.
                 content.clear();
+                content_spans.clear();
                 self.take_contentless_entries()
             } else {
                 self.take_held_entries()
@@ -1653,7 +1983,11 @@ impl ChoiceJailState {
                 logprobs,
             );
             choice.delta.reasoning_content = self.pending_reasoning_content.take();
-            Some(ChoiceEmission::Content(choice))
+            let mut emitted = Emitted::new(ChoiceEmission::Content(choice), content_spans);
+            if emitted.delta.reasoning_content.is_some() {
+                emitted.set_reasoning(self.pending_reasoning_spans.take());
+            }
+            Some(emitted)
         } else {
             None
         };
@@ -1669,6 +2003,7 @@ impl ChoiceJailState {
                         || self.terminal_suffix_after_tool_call)
                 {
                     self.terminal_suffix_buffer.clear();
+                    self.terminal_suffix_spans.clear();
                     self.terminal_suffix_logprobs.clear();
                 }
                 if let Some(last) = emissions.last_mut() {
@@ -1700,6 +2035,7 @@ impl ChoiceJailStateCollection {
         index: u32,
         starts_jailed: bool,
         guided: Option<&ToolChoiceFormat>,
+        record: bool,
     ) -> &mut ChoiceJailState {
         // Find the position where this index should be
         match self.states.binary_search_by_key(&index, |s| s.index) {
@@ -1709,7 +2045,10 @@ impl ChoiceJailStateCollection {
             }
             Err(insert_pos) => {
                 // Need to create new state
-                let new_state = ChoiceJailState::new(index, starts_jailed, guided);
+                let mut new_state = ChoiceJailState::new(index, starts_jailed, guided);
+                if record {
+                    new_state.start_recording();
+                }
                 self.states.insert(insert_pos, new_state);
                 &mut self.states[insert_pos]
             }
@@ -1749,6 +2088,12 @@ pub struct JailedStream {
     /// of this jail (one terminal delta becomes many), so the serving layer opts in
     /// per request rather than inheriting it. Mirrors `StreamBestEffort` in v2.
     guided_streaming: bool,
+    /// Whether this stream records the input ranges of the text it emits.
+    /// Set only by [`JailedStream::apply_pairs`].
+    recording: bool,
+    /// Whether every input item is expected to carry the caller's ranges.
+    /// Set by the public sourced entries.
+    caller_ranges: bool,
 }
 
 impl JailedStream {
@@ -1786,9 +2131,27 @@ impl JailedStream {
         S: Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send + 'static,
     {
         let jail_mode = self.jail_mode.clone();
-        let named_tool_active = self.named_tool_name.is_some();
-        let jailed_stream = self.apply(stream);
-        JailedStream::fix_finish_reason(jailed_stream, jail_mode, named_tool_active)
+        let jailed_stream = self.apply_pairs(false, stream.map(|response| (response, None)));
+        JailedStream::fix_finish_reason(jailed_stream, jail_mode, false)
+            .map(|(response, _)| response)
+    }
+
+    /// [`apply_with_finish_reason`](Self::apply_with_finish_reason), carrying
+    /// the input ranges of each choice's text; see
+    /// [`apply_sourced`](Self::apply_sourced).
+    pub fn apply_with_finish_reason_sourced<S>(
+        mut self,
+        stream: S,
+    ) -> impl Stream<Item = SourcedChunk> + Send
+    where
+        S: Stream<Item = SourcedChunk> + Send + 'static,
+    {
+        let jail_mode = self.jail_mode.clone();
+        let record = self.can_record_sources();
+        self.caller_ranges = true;
+        let jailed_stream = self.apply_pairs(record, stream.map(|item| (item.chunk, item.sources)));
+        JailedStream::fix_finish_reason(jailed_stream, jail_mode, record)
+            .map(|(chunk, sources)| SourcedChunk { chunk, sources })
     }
 
     /// Apply the jail transformation to a stream of chat completion responses
@@ -1800,6 +2163,58 @@ impl JailedStream {
     where
         S: Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send + 'static,
     {
+        self.apply_pairs(false, stream.map(|response| (response, None)))
+            .map(|(response, _)| response)
+    }
+
+    /// [`apply`](Self::apply), carrying the input ranges of each choice's text.
+    ///
+    /// When [`can_record_sources`](Self::can_record_sources) is true, every
+    /// output item carries one [`ChoiceSources`] per choice. Its ranges tile
+    /// that choice's `content` and `reasoning_content`, in the input items'
+    /// offsets, through every hold, cut, trim, and merge. Give every input item
+    /// its `sources`, with an entry for each choice that has text. A choice
+    /// whose text arrives without ranges has no source from then on: its
+    /// output gets no entry, so the caller can tell. When this jail cannot
+    /// record, every output item has `sources: None`. Either way the chunks
+    /// are the ones [`apply`](Self::apply) emits.
+    pub fn apply_sourced<S>(mut self, stream: S) -> impl Stream<Item = SourcedChunk> + Send
+    where
+        S: Stream<Item = SourcedChunk> + Send + 'static,
+    {
+        let record = self.can_record_sources();
+        self.caller_ranges = true;
+        self.apply_pairs(record, stream.map(|item| (item.chunk, item.sources)))
+            .map(|(chunk, sources)| SourcedChunk { chunk, sources })
+    }
+
+    /// Whether [`apply_sourced`](Self::apply_sourced) can record sources for
+    /// this jail: the marker-based jail with `hermes`, `kimi_k2`, or
+    /// `minimax_m3`, whose batch parsers report the ranges of their normal
+    /// text. A caller that needs ranges refuses the request otherwise.
+    pub fn can_record_sources(&self) -> bool {
+        matches!(self.jail_mode, JailMode::MarkerBased)
+            && matches!(
+                self.tool_call_parser.as_deref(),
+                Some("hermes" | "kimi_k2" | "minimax_m3")
+            )
+    }
+
+    /// The jail over items paired with their sources; see
+    /// [`apply_sourced`](Self::apply_sourced). Inside the crate, when the caller
+    /// gives no ranges (`caller_ranges` unset), a choice's offsets count the
+    /// text it received, apart for content and for reasoning.
+    pub(crate) fn apply_pairs<S>(
+        mut self,
+        record: bool,
+        stream: S,
+    ) -> impl Stream<Item = SourcedItem> + Send
+    where
+        S: Stream<Item = SourcedItem> + Send + 'static,
+    {
+        self.recording = record && self.can_record_sources();
+        let recording = self.recording;
+        let caller_ranges = self.caller_ranges;
         let separates_k3_reasoning = is_kimi_k3_parser(self.tool_call_parser.as_deref());
         // Use the stream! macro for cleaner async stream processing
         stream! {
@@ -1816,10 +2231,19 @@ impl JailedStream {
 
             // Pin the stream for iteration (stack pinning is more efficient)
             tokio::pin!(stream);
+            // Choices whose text arrived without the caller's ranges.
+            let mut unsourced: HashSet<u32> = HashSet::new();
 
 
             // Process each item in the stream
-            while let Some(response) = stream.next().await {
+            while let Some((response, input_sources)) = stream.next().await {
+                // Each choice's entry, paired by `match_choice_sources`.
+                let matched: Vec<Option<ChoiceSources>> = match (input_sources, response.data.as_ref()) {
+                    (Some(entries), Some(data)) if recording => {
+                        match_choice_sources(entries, &choice_texts(&data.choices))
+                    }
+                    _ => Vec::new(),
+                };
                 if let Some(chat_response) = response.data.as_ref() {
                     last_stream_id.clone_from(&chat_response.id);
                     last_stream_model.clone_from(&chat_response.model);
@@ -1830,16 +2254,30 @@ impl JailedStream {
                     if chat_response.choices.is_empty() {
                         // No choices processed (e.g., usage-only chunk)
                         // Pass through as-is to preserve usage and other metadata
-                        yield response;
+                        yield (response, recording.then(Vec::new));
                         continue;
                     }
 
                     // Process each choice independently using the new architecture
-                    for choice in &chat_response.choices {
+                    for (position, choice) in chat_response.choices.iter().enumerate() {
                         let recovered_choice = separates_k3_reasoning
                             .then(|| recover_kimi_k3_reasoning_handoff(choice))
                             .flatten();
                         let choice = recovered_choice.as_ref().unwrap_or(choice);
+                        let given = matched.get(position).and_then(Option::as_ref);
+                        if caller_ranges && recording && given.is_none() {
+                            let has_text = matches!(
+                                &choice.delta.content,
+                                Some(ChatCompletionMessageContent::Text(text)) if !text.is_empty()
+                            ) || choice
+                                .delta
+                                .reasoning_content
+                                .as_ref()
+                                .is_some_and(|reasoning| !reasoning.is_empty());
+                            if has_text {
+                                unsourced.insert(choice.index);
+                            }
+                        }
 
                         if let Some(ref content) = choice.delta.content {
                             // Jailing only applies to text content
@@ -1854,14 +2292,26 @@ impl JailedStream {
                                         choice.index,
                                         self.is_immediate(),
                                         self.guided_format(),
+                                        recording,
                                     );
 
                                 if let Some(reasoning_content) = &choice.delta.reasoning_content {
+                                    let reasoning_spans = choice_state.input_spans(
+                                        reasoning_content,
+                                        given.map(|g| &g.reasoning[..]),
+                                        true,
+                                    );
+                                    choice_state.pending_reasoning_spans.append(&reasoning_spans);
                                     let pending = choice_state
                                         .pending_reasoning_content
                                         .get_or_insert_with(String::new);
                                     pending.push_str(reasoning_content);
                                 }
+                                let content_spans = choice_state.input_spans(
+                                    text,
+                                    given.map(|g| &g.content[..]),
+                                    false,
+                                );
 
                                 // Store metadata when any choice becomes jailed (first time only)
                                 if !choice_state.is_jailed && self.should_start_jail(text)
@@ -1876,7 +2326,9 @@ impl JailedStream {
 
                                 // Process this choice and get emissions
                                 let had_tool_calls_before = choice_state.emitted_tool_calls_count > 0;
-                                let mut emissions = choice_state.process_content(choice, text, &self).await;
+                                let mut emissions = choice_state
+                                    .process_content(choice, text, content_spans, &self)
+                                    .await;
                                 choice_state.hold_terminal_suffix(
                                     &mut emissions,
                                     self.terminal_marker_policy,
@@ -1899,6 +2351,7 @@ impl JailedStream {
                                     {
                                         first.choice_mut().delta.reasoning_content =
                                             Some(reasoning);
+                                        first.set_reasoning(choice_state.pending_reasoning_spans.take());
                                     }
                                 }
                                 all_emissions.extend(emissions);
@@ -1919,7 +2372,15 @@ impl JailedStream {
                                     choice.index,
                                     self.is_immediate(),
                                     self.guided_format(),
+                                    recording,
                                 );
+                            let input_reasoning = choice.delta.reasoning_content.as_deref().map(|reasoning| {
+                                choice_state.input_spans(
+                                    reasoning,
+                                    given.map(|g| &g.reasoning[..]),
+                                    true,
+                                )
+                            });
                             // Also track stream finish reason from content-less final chunks
                             // (e.g. finish_reason=Stop arriving in a chunk with content=None) so
                             // the Immediate-mode finalize path can emit the correct finish_reason.
@@ -1952,17 +2413,27 @@ impl JailedStream {
                                     finish_reason: choice.finish_reason.filter(|_| !has_pending_buffered_output),
                                     logprobs,
                                 };
+                                let mut reasoning_spans = choice_state.no_spans();
                                 if separates_k3_reasoning {
                                     if let Some(reasoning_emission) = choice_state.take_pending_reasoning_emission() {
                                         all_emissions.push(reasoning_emission);
                                     }
                                 } else if let Some(mut pending) = choice_state.pending_reasoning_content.take() {
+                                    reasoning_spans = choice_state.pending_reasoning_spans.take();
                                     if let Some(reasoning) = pass_through_choice.delta.reasoning_content.take() {
                                         pending.push_str(&reasoning);
                                     }
                                     pass_through_choice.delta.reasoning_content = Some(pending);
                                 }
-                                all_emissions.push(ChoiceEmission::PassThrough(pass_through_choice));
+                                if let Some(input_reasoning) = &input_reasoning {
+                                    reasoning_spans.append(input_reasoning);
+                                }
+                                let mut emitted = Emitted::new(
+                                    ChoiceEmission::PassThrough(pass_through_choice),
+                                    choice_state.no_spans(),
+                                );
+                                emitted.set_reasoning(reasoning_spans);
+                                all_emissions.push(emitted);
                             } else if choice_state.is_jailed {
                                 append_logprobs(&mut choice_state.accumulated_logprobs, choice.logprobs.clone());
                             } else {
@@ -1979,7 +2450,7 @@ impl JailedStream {
                         let mut passthrough_emissions = Vec::new();
 
                         for emission in all_emissions {
-                            match emission {
+                            match emission.emission() {
                                 ChoiceEmission::PassThrough(_) => passthrough_emissions.push(emission),
                                 ChoiceEmission::ToolCall(_) | ChoiceEmission::Content(_) => {
                                     tool_content_emissions.push(emission);
@@ -1998,7 +2469,8 @@ impl JailedStream {
                         if !passthrough_emissions.is_empty() {
                             let current_metadata = (response.id.clone(), response.event.clone(), response.comment.clone());
                             let responses = self.emit_choice_emissions(passthrough_emissions, chat_response, current_metadata);
-                            for emitted_response in responses {
+                            for mut emitted_response in responses {
+                                drop_unsourced(&unsourced, &mut emitted_response);
                                 yield emitted_response;
                             }
                         }
@@ -2011,7 +2483,8 @@ impl JailedStream {
                                 last_annotated_comment.clone(),
                             );
                             let responses = self.emit_choice_emissions(tool_content_emissions, chat_response, preserved_metadata);
-                            for emitted_response in responses {
+                            for mut emitted_response in responses {
+                                drop_unsourced(&unsourced, &mut emitted_response);
                                 yield emitted_response;
                             }
                         }
@@ -2024,14 +2497,15 @@ impl JailedStream {
                                 last_annotated_comment.clone(),
                             );
                             let responses = self.emit_choice_emissions(trailing_emissions, chat_response, preserved_metadata);
-                            for emitted_response in responses {
+                            for mut emitted_response in responses {
+                                drop_unsourced(&unsourced, &mut emitted_response);
                                 yield emitted_response;
                             }
                         }
                     }
                 } else {
                     // No response data, pass through as-is
-                    yield response;
+                    yield (response, recording.then(Vec::new));
                 }
             }
 
@@ -2062,7 +2536,8 @@ impl JailedStream {
 
                 let final_metadata = (last_annotated_id, last_annotated_event, last_annotated_comment);
                 let responses = self.emit_choice_emissions(final_emissions, &dummy_response, final_metadata);
-                for emitted_response in responses {
+                for mut emitted_response in responses {
+                    drop_unsourced(&unsourced, &mut emitted_response);
                     yield emitted_response;
                 }
             }
@@ -2072,10 +2547,10 @@ impl JailedStream {
     /// Emit choice emissions based on the configured emission mode
     fn emit_choice_emissions(
         &self,
-        emissions: Vec<ChoiceEmission>,
+        emissions: Vec<Emitted>,
         base_response: &CreateChatCompletionStreamResponse,
         annotated_metadata: (Option<String>, Option<String>, Option<Vec<String>>),
-    ) -> Vec<Annotated<CreateChatCompletionStreamResponse>> {
+    ) -> Vec<SourcedItem> {
         if emissions.is_empty() {
             return Vec::new();
         }
@@ -2087,25 +2562,33 @@ impl JailedStream {
                 // Pack all choices into as few responses as possible. One pass can emit
                 // several entries for one choice, and two for one index in one response
                 // is not valid at n = 1; entries that must stay apart get their own.
-                let frames = pack_choices(emissions);
+                let (frames, sources) = pack_choices(emissions);
+                debug_assert_eq!(
+                    sources.is_some(),
+                    self.recording,
+                    "every emission records, or none does"
+                );
+                let mut sources = sources.map(Vec::into_iter);
                 let last = frames.len() - 1;
                 frames
                     .into_iter()
                     .enumerate()
                     .map(|(i, choices)| {
                         let mut response = base_response.clone();
+                        let sources = sources.as_mut().and_then(Iterator::next);
                         response.choices = choices;
                         // Usage describes the whole chunk; count it once.
                         if i != last {
                             response.usage = None;
                         }
-                        Annotated {
+                        let response = Annotated {
                             data: Some(response),
                             id: id.clone(),
                             event: event.clone(),
                             comment: comment.clone(),
                             error: None,
-                        }
+                        };
+                        (response, sources)
                     })
                     .collect()
             }
@@ -2115,15 +2598,18 @@ impl JailedStream {
                     .into_iter()
                     .map(|emission| {
                         let mut response = base_response.clone();
-                        response.choices = vec![emission.into_choice()];
+                        let (choice, sources) = emission.into_parts();
+                        response.choices = vec![choice];
+                        let sources = sources.map(|sources| vec![sources]);
 
-                        Annotated {
+                        let response = Annotated {
                             data: Some(response),
                             id: id.clone(),
                             event: event.clone(),
                             comment: comment.clone(),
                             error: None,
-                        }
+                        };
+                        (response, sources)
                     })
                     .collect()
             }
@@ -2246,10 +2732,13 @@ impl JailedStream {
     }
 
     async fn parse_marker_tool_calls(&self, accumulated_content: &str) -> MarkerParseResult {
-        try_tool_call_parse_aggregate(
+        // The recovery variant stays out of this future: the completion check
+        // runs per chunk, and its future is held across each chunk's await.
+        detect_and_parse_tool_call_sourced(
             accumulated_content,
             self.tool_call_parser.as_deref(),
             self.tool_definitions.as_deref(),
+            self.recording,
         )
         .await
     }
@@ -2433,25 +2922,37 @@ impl JailedStream {
     /// `is_finalize` selects the recovery-enabled aggregator (missing
     /// outer end-token / truncated JSON). Streaming early-exit callers pass
     /// `false`; the stream-end finalize path passes `true`.
+    ///
+    /// Returns the choice and the input ranges of its content. `accumulated_spans`
+    /// are the sources of `accumulated_content`; every edit of the released text
+    /// (a parser's normal text, a cut marker, a trim) keeps the ranges of the
+    /// bytes it keeps.
+    #[allow(clippy::too_many_arguments)]
     async fn create_tool_call_choice(
         &self,
         choice_index: u32,
         accumulated_content: &str,
+        accumulated_spans: &Spans,
         base_choice: &ChatChoiceStream,
         tool_call_offset: usize,
         is_finalize: bool,
         marker_parse_result: Option<MarkerParseResult>,
-    ) -> ChatChoiceStream {
+    ) -> (ChatChoiceStream, Spans) {
+        let record = self.recording;
+        // Ranges in `accumulated_content`, mapped to input ranges.
+        let sourced = |text: &SourcedText| accumulated_spans.map(&text.spans);
+        let whole = || SourcedText::slice(accumulated_content, accumulated_content, record);
         match &self.jail_mode {
             JailMode::MarkerBased => {
                 // Traditional marker-based tool call parsing
                 let parse_result = if let Some(parse_result) = marker_parse_result {
                     parse_result
                 } else if is_finalize {
-                    try_tool_call_parse_aggregate_finalize(
+                    detect_and_parse_tool_call_with_recovery_sourced(
                         accumulated_content,
                         self.tool_call_parser.as_deref(),
                         self.tool_definitions.as_deref(),
+                        record,
                     )
                     .await
                 } else {
@@ -2477,18 +2978,20 @@ impl JailedStream {
                             tool_calls
                         };
 
+                        let normal_text = normal_text.unwrap_or_else(|| SourcedText::empty(record));
                         if tool_calls.is_empty() {
                             // All parsed calls were filtered out — emit the parser's stripped
                             // normal_text, not accumulated_content (which still contains the
                             // raw tool-call markers).
-                            return create_choice_stream(
+                            let choice = create_choice_stream(
                                 choice_index,
                                 Some(Role::Assistant),
-                                normal_text.as_deref().unwrap_or(""),
+                                &normal_text.text,
                                 None,
                                 base_choice.finish_reason,
                                 base_choice.logprobs.clone(),
                             );
+                            return (choice, sourced(&normal_text));
                         }
 
                         // Convert to streaming format
@@ -2506,14 +3009,15 @@ impl JailedStream {
                                 }),
                             })
                             .collect();
-                        create_choice_stream(
+                        let choice = create_choice_stream(
                             choice_index,
                             Some(Role::Assistant),
-                            normal_text.as_deref().unwrap_or(""),
+                            &normal_text.text,
                             Some(tool_call_chunks),
                             base_choice.finish_reason,
                             base_choice.logprobs.clone(),
-                        )
+                        );
+                        (choice, sourced(&normal_text))
                     }
                     Ok((_, normal_text)) => {
                         // Parser succeeded but extracted no structured tool calls. Most parsers
@@ -2533,7 +3037,7 @@ impl JailedStream {
                         // stripping Harmony envelopes when no reasoning parser is configured.
                         // In zero-call Harmony marker cases, emit the stripped normal_text rather
                         // than accumulated_content, which still contains raw protocol markers.
-                        let content: String = if is_finalize
+                        let content: SourcedText = if is_finalize
                             && self.tool_call_parser.as_deref() == Some("minimax_m2")
                             && self
                                 .prefix_before_first_tool_call_marker(accumulated_content)
@@ -2542,11 +3046,15 @@ impl JailedStream {
                             // MiniMax's reference parser is strict: missing paired fences means
                             // zero recovered calls. The raw `<minimax:tool_call>` envelope is
                             // still protocol markup, so keep only pre-call prose at stream end.
-                            self.prefix_before_first_tool_call_marker(accumulated_content)
-                                .unwrap_or("")
-                                .to_string()
-                        } else if normal_text.as_deref() == Some("") {
-                            String::new()
+                            let prefix = self
+                                .prefix_before_first_tool_call_marker(accumulated_content)
+                                .unwrap_or(&accumulated_content[..0]);
+                            SourcedText::slice(accumulated_content, prefix, record)
+                        } else if normal_text
+                            .as_ref()
+                            .is_some_and(|normal| normal.text.is_empty())
+                        {
+                            SourcedText::empty(record)
                         } else if is_kimi_k3_parser(self.tool_call_parser.as_deref()) {
                             // K3's parser owns both response and tools
                             // channels. Its stripped response text is therefore
@@ -2556,7 +3064,7 @@ impl JailedStream {
                         } else if is_harmony_parser(self.tool_call_parser.as_deref())
                             && contains_harmony_protocol(accumulated_content)
                         {
-                            normal_text.as_deref().unwrap_or("").to_string()
+                            normal_text.unwrap_or_else(|| SourcedText::empty(record))
                         } else if self.suppresses_tool_call_markup() {
                             // No call parsed out of a jailed buffer: strip the markers rather
                             // than leak the raw text. Handled in the jail so it holds regardless
@@ -2566,34 +3074,35 @@ impl JailedStream {
                             {
                                 // Truncated / unparseable wrapper: keep the prose before the
                                 // opening marker, drop the rest.
-                                prefix.trim_end().to_string()
+                                SourcedText::slice(accumulated_content, prefix.trim_end(), record)
                             } else if self.jail_end_sequences.iter().any(|seq| {
                                 !seq.is_empty() && accumulated_content.contains(seq.as_str())
                             }) {
                                 // Orphan close marker(s) with no opener: remove every occurrence
                                 // (not just trailing) so a mid-buffer marker can't leak.
-                                let mut cleaned = accumulated_content.to_string();
+                                let mut cleaned = whole();
                                 for seq in self.jail_end_sequences.iter().filter(|s| !s.is_empty())
                                 {
-                                    cleaned = cleaned.replace(seq.as_str(), "");
+                                    cleaned.remove_all(seq);
                                 }
-                                cleaned.trim().to_string()
+                                cleaned.trim()
                             } else {
                                 // No markers: false-positive jail entry on prose, pass through.
-                                accumulated_content.to_string()
+                                whole()
                             }
                         } else {
                             // Other parsers / generic jails: release the buffer verbatim.
-                            accumulated_content.to_string()
+                            whole()
                         };
-                        create_choice_stream(
+                        let choice = create_choice_stream(
                             choice_index,
                             Some(Role::Assistant),
-                            &content,
+                            &content.text,
                             None,
                             base_choice.finish_reason,
                             base_choice.logprobs.clone(),
-                        )
+                        );
+                        (choice, sourced(&content))
                     }
                     Err(e) => {
                         // Parser errored — emit empty content rather than the raw buffer.
@@ -2604,14 +3113,15 @@ impl JailedStream {
                             error = %e,
                             "tool-call parser errored; dropping buffered content to avoid marker leak"
                         );
-                        create_choice_stream(
+                        let choice = create_choice_stream(
                             choice_index,
                             Some(Role::Assistant),
                             "",
                             None,
                             base_choice.finish_reason,
                             base_choice.logprobs.clone(),
-                        )
+                        );
+                        (choice, Spans::recording(record))
                     }
                 }
             }
@@ -2744,7 +3254,8 @@ impl JailedStream {
                     }
                 }
 
-                if !tool_call_chunks.is_empty() {
+                // Recording refuses this mode, so the content has no ranges.
+                let choice = if !tool_call_chunks.is_empty() {
                     create_choice_stream(
                         choice_index,
                         Some(Role::Assistant),
@@ -2774,7 +3285,8 @@ impl JailedStream {
                         base_choice.finish_reason,
                         base_choice.logprobs.clone(),
                     )
-                }
+                };
+                (choice, Spans::OFF)
             }
         }
     }
@@ -2846,15 +3358,30 @@ impl JailedStream {
 
     /// Post-processor that sets finish_reason to ToolCalls when tool calls were emitted
     /// This should be called after apply() to fix the finish_reason for tool call chunks
+    ///
+    /// It changes no text, so each item's sources pass through. While
+    /// `recording`, a chunk it adds carries an empty entry for its choice.
     fn fix_finish_reason<S>(
         input_stream: S,
         jail_mode: JailMode,
-        named_tool_active: bool,
-    ) -> impl Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send
+        recording: bool,
+    ) -> impl Stream<Item = SourcedItem> + Send
     where
-        S: Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send + 'static,
+        S: Stream<Item = SourcedItem> + Send + 'static,
     {
-        let _ = named_tool_active;
+        // A chunk it adds names a choice; one whose text had no source gets
+        // no entry, as the jail gave it none.
+        let added = move |index: u32, unsourced: &HashSet<u32>| {
+            recording.then(|| {
+                if unsourced.contains(&index) {
+                    return Vec::new();
+                }
+                vec![ChoiceSources {
+                    index,
+                    ..ChoiceSources::default()
+                }]
+            })
+        };
         let _ = &jail_mode;
         stream! {
             tokio::pin!(input_stream);
@@ -2870,7 +3397,17 @@ impl JailedStream {
             // to terminate even if an earlier empty-choices chunk emitted nothing.
             let mut synthesized: HashSet<u32> = HashSet::new();
 
-            while let Some(mut response) = input_stream.next().await {
+            let mut unsourced: HashSet<u32> = HashSet::new();
+            while let Some((mut response, sources)) = input_stream.next().await {
+                // While recording, the jail gives every choice an entry unless
+                // its text has no source.
+                if let (Some(sources), Some(data)) = (&sources, &response.data) {
+                    for choice in &data.choices {
+                        if !sources.iter().any(|entry| entry.index == choice.index) {
+                            unsourced.insert(choice.index);
+                        }
+                    }
+                }
                 // Track if any choice emitted tool calls, and which already terminated.
                 if let Some(ref data) = response.data {
                     for choice in &data.choices {
@@ -2937,18 +3474,21 @@ impl JailedStream {
                         .collect();
                     indices.sort_unstable();
                     for index in indices {
-                        yield stream_choice_chunk_from_template(
-                            template,
-                            index,
-                            None,
-                            None,
-                            Some(FinishReason::ToolCalls),
+                        yield (
+                            stream_choice_chunk_from_template(
+                                template,
+                                index,
+                                None,
+                                None,
+                                Some(FinishReason::ToolCalls),
+                            ),
+                            added(index, &unsourced),
                         );
                         synthesized.insert(index);
                     }
                 }
 
-                yield response;
+                yield (response, sources);
             }
 
             // Backstop: the stream ended without a finish_reason AND without an
@@ -2968,12 +3508,15 @@ impl JailedStream {
                     .collect();
                 indices.sort_unstable();
                 for index in indices {
-                    yield stream_choice_chunk_from_template(
-                        &template,
-                        index,
-                        None,
-                        None,
-                        Some(FinishReason::ToolCalls),
+                    yield (
+                        stream_choice_chunk_from_template(
+                            &template,
+                            index,
+                            None,
+                            None,
+                            Some(FinishReason::ToolCalls),
+                        ),
+                        added(index, &unsourced),
                     );
                     synthesized.insert(index);
                 }
@@ -3245,6 +3788,8 @@ impl JailedStreamBuilder {
             marker_matcher,
             jail_mode: self.jail_mode,
             guided_streaming: self.guided_streaming,
+            recording: false,
+            caller_ranges: false,
         }
     }
 }
@@ -3319,6 +3864,66 @@ fn apply_tool_calling_jail_configured<S>(
 where
     S: Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send + 'static,
 {
+    tool_calling_jail(
+        tool_call_parser,
+        tool_choice,
+        tool_definitions,
+        uses_tool_call_structural_tag,
+        guided_streaming,
+    )
+    .apply_with_finish_reason(stream)
+}
+
+/// [`apply_tool_calling_jail`], carrying the input ranges of each choice's
+/// text; see [`JailedStream::apply_sourced`] for the contract. The chunks are
+/// the ones [`apply_tool_calling_jail`] emits. Check
+/// [`tool_calling_jail_can_record_sources`] first: when it is false, every
+/// output item has `sources: None`.
+pub fn apply_tool_calling_jail_sourced<S>(
+    tool_call_parser: Option<String>,
+    tool_choice: Option<dynamo_protocols::types::ChatCompletionToolChoiceOption>,
+    tool_definitions: Option<Vec<crate::tool_calling::ToolDefinition>>,
+    uses_tool_call_structural_tag: bool,
+    stream: S,
+) -> impl Stream<Item = SourcedChunk> + Send
+where
+    S: Stream<Item = SourcedChunk> + Send + 'static,
+{
+    tool_calling_jail(
+        tool_call_parser,
+        tool_choice,
+        tool_definitions,
+        uses_tool_call_structural_tag,
+        false,
+    )
+    .apply_with_finish_reason_sourced(stream)
+}
+
+/// Whether [`apply_tool_calling_jail_sourced`] records sources for these
+/// arguments.
+pub fn tool_calling_jail_can_record_sources(
+    tool_call_parser: Option<String>,
+    tool_choice: Option<dynamo_protocols::types::ChatCompletionToolChoiceOption>,
+    uses_tool_call_structural_tag: bool,
+) -> bool {
+    tool_calling_jail(
+        tool_call_parser,
+        tool_choice,
+        None,
+        uses_tool_call_structural_tag,
+        false,
+    )
+    .can_record_sources()
+}
+
+/// The jail that the `apply_tool_calling_jail*` entries configure.
+fn tool_calling_jail(
+    tool_call_parser: Option<String>,
+    tool_choice: Option<dynamo_protocols::types::ChatCompletionToolChoiceOption>,
+    tool_definitions: Option<Vec<crate::tool_calling::ToolDefinition>>,
+    uses_tool_call_structural_tag: bool,
+    guided_streaming: bool,
+) -> JailedStream {
     use dynamo_protocols::types::ChatCompletionToolChoiceOption;
 
     let mut builder = JailedStream::builder().guided_streaming(guided_streaming);
@@ -3389,8 +3994,7 @@ where
         }
     }
 
-    let jail = builder.build();
-    jail.apply_with_finish_reason(stream)
+    builder.build()
 }
 
 #[cfg(test)]
@@ -4364,7 +4968,7 @@ mod tests {
             .remove(0);
         held_choice.delta.role = None;
         let held_logprobs = held_choice.logprobs.clone();
-        let mut held = vec![ChoiceEmission::Content(held_choice)];
+        let mut held = vec![Emitted::from(ChoiceEmission::Content(held_choice))];
         state.hold_terminal_suffix(&mut held, policy);
         let mut call = create_choice_stream(
             0,
@@ -4386,7 +4990,7 @@ mod tests {
         if !text_present {
             call.delta.content = None;
         }
-        let mut emissions = vec![ChoiceEmission::ToolCall(call.clone())];
+        let mut emissions = vec![Emitted::from(ChoiceEmission::ToolCall(call.clone()))];
         state.hold_terminal_suffix(&mut emissions, policy);
 
         assert_eq!(emissions.len(), 2);
@@ -4539,7 +5143,7 @@ mod tests {
             .unwrap()
             .truncate(1);
         let original = choice.clone();
-        let mut emissions = vec![ChoiceEmission::Content(original.clone())];
+        let mut emissions = vec![Emitted::from(ChoiceEmission::Content(original.clone()))];
         state.hold_terminal_suffix(
             &mut emissions,
             crate::tool_calling::xtml::TERMINAL_MARKER_POLICY,
@@ -4791,6 +5395,7 @@ mod tests {
         let mut emissions = Vec::new();
         state.handle_trailing_content(
             "answer < ",
+            Spans::OFF,
             &choice(&["answer", " ", "<", " "]),
             lp(&["answer", " ", "<", " "]),
             &jail_stream,
@@ -4798,6 +5403,7 @@ mod tests {
         );
         state.handle_trailing_content(
             "more < ",
+            Spans::OFF,
             &choice(&["more", " ", "<", " "]),
             lp(&["more", " ", "<", " "]),
             &jail_stream,
@@ -5268,8 +5874,10 @@ mod tests {
             tool_call_choices_chunk(&[2, 0, 1]),
             usage_only_chunk(),
         ];
+        let pairs = chunks.into_iter().map(|chunk| (chunk, None));
         let responses: Vec<_> =
-            JailedStream::fix_finish_reason(stream::iter(chunks), JailMode::MarkerBased, false)
+            JailedStream::fix_finish_reason(stream::iter(pairs), JailMode::MarkerBased, false)
+                .map(|(response, _)| response)
                 .collect()
                 .await;
         let usage_positions: Vec<_> = responses
@@ -5374,9 +5982,9 @@ mod tests {
             logprobs_of(&["t1"]),
         );
 
-        let frames = pack_choices(vec![
-            ChoiceEmission::ToolCall(fragment),
-            ChoiceEmission::ToolCall(remainder),
+        let (frames, _) = pack_choices(vec![
+            ChoiceEmission::ToolCall(fragment).into(),
+            ChoiceEmission::ToolCall(remainder).into(),
         ]);
 
         assert_eq!(frames.len(), 1);
@@ -5423,9 +6031,9 @@ mod tests {
             None,
         );
 
-        let frames = pack_choices(vec![
-            ChoiceEmission::ToolCall(first),
-            ChoiceEmission::ToolCall(second),
+        let (frames, _) = pack_choices(vec![
+            ChoiceEmission::ToolCall(first).into(),
+            ChoiceEmission::ToolCall(second).into(),
         ]);
 
         assert_eq!(frames.len(), 1);
@@ -5451,10 +6059,10 @@ mod tests {
         let text = create_choice_stream(0, None, "after", None, None, None);
         let other = create_choice_stream(1, None, "other", None, None, None);
 
-        let frames = pack_choices(vec![
-            ChoiceEmission::PassThrough(parts),
-            ChoiceEmission::PassThrough(other),
-            ChoiceEmission::PassThrough(text),
+        let (frames, _) = pack_choices(vec![
+            ChoiceEmission::PassThrough(parts).into(),
+            ChoiceEmission::PassThrough(other).into(),
+            ChoiceEmission::PassThrough(text).into(),
         ]);
 
         let indices: Vec<Vec<u32>> = frames

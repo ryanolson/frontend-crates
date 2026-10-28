@@ -19,6 +19,11 @@ The rules an OpenAI chat frontend uses to pick and drive Dynamo's parsers. The p
 | `unified_stream` | The v2 stream adapter: one unified parser per choice turns raw model text into reasoning, content, and tool-call chunks, then fixes each choice's finish reason. |
 | `stream_item` | The stream item that `unified_stream` reads. Dynamo implements it for its own item, so its per-chunk fields (`nvext`, metrics, completion evidence) stay in place. A chunk with a `SourceSlot` (from `dynamo-parsers`) also gets, for each choice, the input byte ranges its text came from. |
 | `guided` | `GuidedToolConstraint`: the tool-output grammar a request installed. |
+| `chat_stream` | `parse_chat_stream`: the parse stage of a chat stream. It picks the stages for a request (the v2 adapter, or dynamo-parsers' v1 reasoning stream and the caller's v1 jail) and chains the stream policies after them. |
+| `reasoning_off` | Whether a request turned reasoning off, and the fold of reasoning into content when it did. On items with a source slot, the reasoning ranges move with the folded text. |
+| `nonempty_content` | The `force_nonempty_content` contract on a stream, and whether a stream can hold back all output (the keep-alive predicate). On items with a source slot, held text keeps its ranges wherever it is released. |
+| `tool_call_policy` | The request's tool-call policy on parsed output, and the assistant role on each choice's first delta. |
+| `reasoning_usage` | The `reasoning_tokens` estimate in the usage chunk. |
 
 ```rust
 use dynamo_chat_parsing::{ParserVersion, ToolProcessingRoute, tool_processing_route};
@@ -37,3 +42,5 @@ cargo test -p dynamo-chat-parsing
 `tests/dynamo_llm_parity.rs` replays the output of dynamo-llm's own code, recorded by `tests/data/recorder.rs`, and checks that this crate gives the same answer on the same input. `tests/moved_from_dynamo_llm.rs` holds dynamo-llm's tests of these rules.
 
 `tests/unified_stream_parity.rs` does the same for the v2 stream adapter, with output recorded by `tests/data/unified_stream_recorder.rs`. dynamo-llm's unit tests for the adapter are in `src/unified_stream_tests.rs`.
+
+`tests/stream_policies_parity.rs` does the same for `parse_chat_stream` and the stream policies, with two fixtures: a matrix of parser pairs, requests, and streams recorded by `tests/data/stream_policies_recorder.rs`, and every call that dynamo-llm's own tests make, captured by `tests/data/stream_policies_capture.rs`. dynamo-llm's unit tests for the policies are in `src/stream_policies_tests.rs`.
