@@ -416,3 +416,36 @@ async fn the_policy_source_checker_rejects_a_range_inside_the_opener() {
         "a range inside the stripped <think> opener cannot source reasoning text"
     );
 }
+
+#[test]
+fn partial_gemma_labels_are_design_refusals() {
+    assert!(!refuses_by_design(&json!({
+        "family": "gemma4", "prefix": "<|channel>"
+    })));
+    for prefix in ["<|channel>t", "<|channel>thought"] {
+        assert!(refuses_by_design(&json!({
+            "family": "gemma4", "prefix": prefix
+        })));
+    }
+}
+
+#[tokio::test]
+#[ignore = "F4: the refusal predicate treats a complete Gemma header as a partial label"]
+async fn a_complete_gemma_header_is_not_a_design_refusal() {
+    let mut case = corpus()
+        .into_iter()
+        .find(|case| case["name"] == "gemma_prefix/10/answer")
+        .unwrap();
+    case["name"] = json!("gemma_prefix/18/answer");
+    case["prefix"] = json!("<|channel>thought\n");
+    let (_, texts) = input(&case, true);
+    let stock = run(&case, false, false, false).await;
+    let recorded = run(&case, true, false, false).await;
+    assert!(recorded.iter().all(|item| item.chunk.error.is_none()));
+    assert_eq!(id_shape(&recorded), id_shape(&stock));
+    check(&recorded, &texts).unwrap();
+    assert!(
+        !refuses_by_design(&case),
+        "the complete header records successfully and holds no prompt label bytes"
+    );
+}
