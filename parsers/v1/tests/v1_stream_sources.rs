@@ -524,3 +524,110 @@ fn the_jail_records_only_for_the_three_marker_parsers() {
         false
     ));
 }
+
+#[tokio::test]
+async fn review_f2_missing_ranges_remain_fail_closed() {
+    let cases = [
+        (
+            "reasoning-only input",
+            json!({"kind": "reasoning", "reasoning_parser": "qwen3", "options": {}}),
+            json!({"reasoning_content": "R"}),
+            "A",
+        ),
+        (
+            "strip reasoning-only input",
+            json!({"kind": "strip", "think_start_token": "<think>"}),
+            json!({"reasoning_content": "R"}),
+            "A",
+        ),
+        (
+            "guided JSON bypass",
+            json!({"kind": "reasoning", "reasoning_parser": "deepseek_r1", "options": {"bypass_bare_guided_json": true}}),
+            json!({"content": "{"}),
+            "}",
+        ),
+    ];
+    let mut violations = Vec::new();
+    for (label, stage, first_delta, second_text) in cases {
+        let first = to_item(&json!({"data": {"choices": [{"index": 0, "delta": first_delta}]}}));
+        let second = to_item(
+            &json!({"data": {"choices": [{"index": 0, "delta": {"content": second_text}}]}}),
+        );
+        let input = vec![
+            SourcedChunk {
+                chunk: first,
+                sources: Some(vec![]),
+            },
+            SourcedChunk {
+                chunk: second.clone(),
+                sources: Some(vec![ChoiceSources {
+                    index: 0,
+                    content: vec![100..101],
+                    reasoning: vec![],
+                }]),
+            },
+        ];
+        let output = run_sourced(&stage, input).await;
+        assert!(output[0].0.sources().unwrap().is_empty());
+        if !output[1].0.sources().unwrap().is_empty() {
+            violations.push(label);
+        }
+
+        let control = vec![
+            SourcedChunk {
+                chunk: to_item(&json!({"data": {"choices": [{"index": 0, "delta": {}}]}})),
+                sources: Some(vec![]),
+            },
+            SourcedChunk {
+                chunk: second,
+                sources: Some(vec![ChoiceSources {
+                    index: 0,
+                    content: vec![100..101],
+                    reasoning: vec![],
+                }]),
+            },
+        ];
+        let control = run_sourced(&stage, control).await;
+        assert_eq!(
+            control[1].0.sources().unwrap().len(),
+            1,
+            "{label}: a choice with no text needs no ranges"
+        );
+    }
+    assert!(
+        violations.is_empty(),
+        "source entries resume after a gap: {violations:?}"
+    );
+}
+
+#[tokio::test]
+async fn review_f3_jail_dates_duplicate_choices_in_caller_offsets() {
+    let stage = json!({"kind": "jail", "tool_call_parser": "hermes", "options": {}});
+    let chunk = to_item(&json!({"data": {"choices": [
+        {"index": 0, "delta": {"content": "A"}},
+        {"index": 0, "delta": {"content": "B"}}
+    ]}}));
+    let input = vec![SourcedChunk {
+        chunk,
+        sources: Some(vec![
+            ChoiceSources {
+                index: 0,
+                content: vec![100..101],
+                reasoning: vec![],
+            },
+            ChoiceSources {
+                index: 0,
+                content: vec![200..201],
+                reasoning: vec![],
+            },
+        ]),
+    }];
+    let output = run_sourced(&stage, input).await;
+    let (text, offsets) = content_offsets(&output);
+    assert_eq!(text, "AB");
+    assert_eq!(
+        offsets,
+        [100, 200],
+        "each duplicate choice has its own caller ranges"
+    );
+}
