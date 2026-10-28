@@ -26,3 +26,7 @@ percent-encoding = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+
+[[bench]]
+name = "source_recording"
+harness = false
