@@ -182,15 +182,18 @@ pub fn stream_can_defer_all_output(
         && !is_reasoning_disabled_by_request(reasoning_parser, chat_template_args)
 }
 
-/// The deferral of one chunk: it edits `response` in place and returns the
-/// prefix choices to emit before it, or `None` when the chunk has no data. It
-/// is a plain function so that its locals stay out of the stream's state,
-/// which is held across every yield.
+/// The deferral of one chunk: it edits `response` in place, writes the prefix
+/// choices to emit before it into `prefix_choices`, and returns `false` when
+/// the chunk has no data. It is a plain function so that its locals stay out
+/// of the stream's state, which is held across every yield, and it writes
+/// into the caller's buffer rather than returning one, which cost a copy per
+/// chunk.
 fn defer_chunk<I: PolicyStreamItem>(
     states: &mut HashMap<u32, DeferredUnifiedChoice>,
     last_response: &mut Option<I>,
     response: &mut I,
-) -> Option<Vec<(ChatChoiceStream, Option<ChoiceSources>)>> {
+    prefix_choices: &mut Vec<(ChatChoiceStream, Option<ChoiceSources>)>,
+) -> bool {
     // While recording, the input slot gives each choice's ranges and
     // the output slot gets the ranges of the text this stage emits.
     let entries = response.sources_mut().map(std::mem::take);
@@ -203,8 +206,9 @@ fn defer_chunk<I: PolicyStreamItem>(
     };
     let mut matched = entries.map(|entries| match_choice_sources(entries, &texts));
     let mut output_sources: Vec<ChoiceSources> = Vec::new();
-    let data = response.chunk_mut()?;
-    let mut prefix_choices = Vec::new();
+    let Some(data) = response.chunk_mut() else {
+        return false;
+    };
 
     for (position, choice) in data.choices.iter_mut().enumerate() {
         let state = states.entry(choice.index).or_default();
@@ -392,7 +396,7 @@ fn defer_chunk<I: PolicyStreamItem>(
     if has_choices {
         *last_response = Some(response.clone());
     }
-    Some(prefix_choices)
+    true
 }
 
 /// Apply the request-level non-empty-content contract after a unified parser has
@@ -411,6 +415,7 @@ where
     async_stream::stream! {
         let mut states: HashMap<u32, DeferredUnifiedChoice> = HashMap::new();
         let mut last_response: Option<I> = None;
+        let mut prefix_choices = Vec::new();
         tokio::pin!(stream_in);
 
         while let Some(mut response) = stream_in.next().await {
@@ -418,12 +423,11 @@ where
                 yield response;
                 return;
             }
-            let Some(prefix_choices) = defer_chunk(&mut states, &mut last_response, &mut response)
-            else {
+            if !defer_chunk(&mut states, &mut last_response, &mut response, &mut prefix_choices) {
                 yield response;
                 continue;
-            };
-            for (prefix_choice, sources) in prefix_choices {
+            }
+            for (prefix_choice, sources) in prefix_choices.drain(..) {
                 let mut prefix_response = response.clone();
                 prefix_response.scrub_synthetic();
                 if let Some(prefix_data) = prefix_response.chunk_mut() {
