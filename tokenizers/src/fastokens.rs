@@ -53,6 +53,9 @@ fn fast_encode_segments(
 pub struct FastTokenizer {
     fast_encoder: fastokens::Tokenizer,
     hf_decoder: HuggingFaceTokenizer,
+    /// Why the prefix cache cannot split this tokenizer's prompts, if it
+    /// cannot. fastokens matches added tokens in one pass.
+    prefix_cache_hazard: Option<String>,
 }
 
 impl FastTokenizer {
@@ -60,11 +63,72 @@ impl FastTokenizer {
         let fast_encoder = fastokens::Tokenizer::from_file(Path::new(path))
             .map_err(|e| Error::msg(format!("Error loading fastokens tokenizer: {e}")))?;
         let hf_decoder = HuggingFaceTokenizer::from_file(path)?;
+        let prefix_cache_hazard = match encoded_added_tokens(Path::new(path), &hf_decoder) {
+            Some(view) => crate::cache::hazard::prefix_cache_hazard_in_json(&view),
+            None => Some("tokenizer.json or tokenizer_config.json does not read again".into()),
+        };
         Ok(Self {
             fast_encoder,
             hf_decoder,
+            prefix_cache_hazard,
         })
     }
+}
+
+/// `tokenizer.json` with the added tokens fastokens encodes with: the file's
+/// own, then each token of `tokenizer_config.json` whose content and id the
+/// file does not have, as fastokens merges them. A token the Hugging Face
+/// side calls special is marked special, because callers of the prefix cache
+/// take their special tokens from that side.
+fn encoded_added_tokens(path: &Path, hf: &HuggingFaceTokenizer) -> Option<serde_json::Value> {
+    use serde_json::Value;
+
+    let read = |path: &Path| -> Option<Value> {
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    };
+    let mut json = read(path)?;
+    let config_path = path.with_file_name("tokenizer_config.json");
+    let config = if config_path.exists() {
+        Some(read(&config_path)?)
+    } else {
+        None
+    };
+    if json.get("added_tokens").is_none_or(Value::is_null) {
+        json["added_tokens"] = Value::Array(Vec::new());
+    }
+    let tokens = json.get_mut("added_tokens")?.as_array_mut()?;
+    let decoder = config
+        .as_ref()
+        .and_then(|config| config.get("added_tokens_decoder"))
+        .and_then(Value::as_object);
+    for (id, spec) in decoder.into_iter().flatten() {
+        let (Ok(id), Some(content)) = (
+            id.parse::<u64>(),
+            spec.get("content").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let known = tokens.iter().any(|token| {
+            token.get("id").and_then(Value::as_u64) == Some(id)
+                || token.get("content").and_then(Value::as_str) == Some(content)
+        });
+        if !known {
+            let mut token = spec.clone();
+            token["id"] = Value::from(id);
+            tokens.push(token);
+        }
+    }
+    let specials = hf.special_token_contents();
+    for token in tokens.iter_mut() {
+        if token
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| specials.contains(content))
+        {
+            token["special"] = Value::Bool(true);
+        }
+    }
+    Some(json)
 }
 
 impl Encoder for FastTokenizer {
@@ -95,6 +159,10 @@ impl Decoder for FastTokenizer {
 impl Tokenizer for FastTokenizer {
     fn validate_prefix_cache(&self) -> Result<()> {
         Ok(())
+    }
+
+    fn prefix_cache_hazard(&self) -> Option<String> {
+        self.prefix_cache_hazard.clone()
     }
 
     // `fast_encoder` and `hf_decoder` are loaded from the same tokenizer.json,
