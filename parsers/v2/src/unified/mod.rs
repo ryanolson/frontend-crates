@@ -449,6 +449,28 @@ pub trait UnifiedParser: Send {
         String::new()
     }
 
+    /// Record the input byte range behind every committed Text and Reasoning byte.
+    ///
+    /// Call after [`Self::initialize_request`] and before the first parse. Feed
+    /// text only: while recording, [`Self::parse_token_ids_into`] fails. Offsets
+    /// count the text this instance received through [`Self::parse_into`] since
+    /// recording was turned on, and keep counting across [`Self::reset`] and a new
+    /// request. Returns `false` when this parser cannot record exact ranges, so the
+    /// caller can refuse the request. Guided tool output never records.
+    ///
+    /// The families on the shared scanner and GPT-OSS record. Kimi K3, Muse
+    /// Glimmer, and Muse Spark return `false`.
+    fn record_sources(&mut self) -> bool {
+        false
+    }
+
+    /// Move the input ranges of the Text and Reasoning bytes committed since the
+    /// last call into `out`, in output order. Text returned by [`Self::reset`]
+    /// counts as committed. A failed [`Self::finish`] returns no events, so its
+    /// text has no ranges. Each range's input bytes equal the text bytes it
+    /// stands for, and the ranges tile that text with no gap.
+    fn take_sources(&mut self, _out: &mut Vec<std::ops::Range<usize>>) {}
+
     /// Whether decoded output must keep tokenizer special tokens.
     ///
     /// Mirrors the tool trait's method of the same name: a family whose markers
@@ -464,19 +486,6 @@ pub trait UnifiedParser: Send {
     fn tool_call_id(&self, _tool_index: usize) -> Option<&str> {
         None
     }
-
-    /// Record where committed text came from. Call before the first parse.
-    ///
-    /// Returns `false` when this parser cannot, so the caller can refuse the
-    /// request. The default cannot.
-    fn record_sources(&mut self) -> bool {
-        false
-    }
-
-    /// Move the input byte ranges of the Text and Reasoning bytes committed since
-    /// the last call into `out`, in output order. Offsets count every byte this
-    /// parser received. The default records nothing.
-    fn take_sources(&mut self, _out: &mut Vec<std::ops::Range<usize>>) {}
 }
 
 /// Allocation conveniences over the required [`UnifiedParser`] lifecycle.
@@ -913,6 +922,17 @@ impl<E: InvokeEmitter> ScannerUnified<E> {
 }
 
 impl<E: InvokeEmitter + Send> NativeUnified for ScannerUnified<E> {
+    /// The shared scanner commits text only as verbatim buffer prefixes, so every
+    /// family on it records exact ranges.
+    fn record_sources(&mut self) -> bool {
+        self.scanner.record_sources();
+        true
+    }
+
+    fn take_sources(&mut self, out: &mut Vec<std::ops::Range<usize>>) {
+        self.scanner.take_sources(out);
+    }
+
     fn preserve_special_tokens(&self) -> bool {
         self.scanner.preserve_special_tokens()
     }
@@ -977,7 +997,14 @@ impl<E: InvokeEmitter + Send> NativeUnified for ScannerUnified<E> {
     }
 
     fn finish_native(&mut self, output: &mut UnifiedParserOutput) -> Result<()> {
-        self.scanner.finish_ordered_into(output)
+        // `GuidedRouted::finish` drops the output on error, so the ranges of the
+        // text this call emitted go with it.
+        let mark = self.scanner.sources_mark();
+        let result = self.scanner.finish_ordered_into(output);
+        if result.is_err() {
+            self.scanner.restore_sources(mark);
+        }
+        result
     }
 
     fn allow_implicit_tool_terminator(&mut self) {
@@ -1010,6 +1037,14 @@ pub(crate) enum GuidedPrefilledHeader {
 
 pub(crate) trait NativeUnified {
     fn preserve_message_phases(&mut self, _enabled: bool) {}
+
+    /// See [`UnifiedParser::record_sources`]. Native mode only.
+    fn record_sources(&mut self) -> bool {
+        false
+    }
+
+    /// See [`UnifiedParser::take_sources`].
+    fn take_sources(&mut self, _out: &mut Vec<std::ops::Range<usize>>) {}
 
     /// Whether decoding must preserve tokenizer special tokens for this grammar.
     ///
@@ -1128,6 +1163,9 @@ pub(crate) struct GuidedRouted<N: NativeUnified> {
     guided_prefilled_tool: bool,
     initial_guided_tool: Option<String>,
     guided_token_input: bool,
+    /// Source recording is on. Guided mode cannot record, so a later guided
+    /// initialization fails instead of silently returning no ranges.
+    recording: bool,
     started: bool,
     finished: bool,
 }
@@ -1146,6 +1184,7 @@ impl<N: NativeUnified> GuidedRouted<N> {
             guided_prefilled_tool: false,
             initial_guided_tool: None,
             guided_token_input: false,
+            recording: false,
             started: false,
             finished: false,
         }
@@ -1177,6 +1216,9 @@ impl<N: NativeUnified> GuidedRouted<N> {
         // half-configured, and a caller that caught the error and retried in a
         // supported mode was building on mutated state. A failed initialize must be a
         // no-op.
+        if self.recording && tool_output_mode != UnifiedToolOutputMode::Native {
+            anyhow::bail!("source recording does not support guided tool output");
+        }
         let guided_reasoning = match tool_output_mode {
             UnifiedToolOutputMode::Native => None,
             UnifiedToolOutputMode::GuidedJson { .. } => match reasoning {
@@ -1291,6 +1333,18 @@ impl<N: NativeUnified> GuidedRouted<N> {
 }
 
 impl<N: NativeUnified + Send> UnifiedParser for GuidedRouted<N> {
+    fn record_sources(&mut self) -> bool {
+        if self.started || self.finished || self.guided.is_some() {
+            return false;
+        }
+        self.recording = self.native.record_sources();
+        self.recording
+    }
+
+    fn take_sources(&mut self, out: &mut Vec<std::ops::Range<usize>>) {
+        self.native.take_sources(out);
+    }
+
     fn preserve_message_phases(&mut self, enabled: bool) {
         self.preserve_phases = enabled;
         self.native.preserve_message_phases(enabled);
@@ -1350,6 +1404,11 @@ impl<N: NativeUnified + Send> UnifiedParser for GuidedRouted<N> {
         }
         if !self.native.input_capabilities().token_ids {
             anyhow::bail!("this unified parser does not support token-id ingestion");
+        }
+        // Ranges are offsets into the text fed through `parse_into`. Token input
+        // has no such bytes, so its text could not be dated.
+        if self.recording {
+            anyhow::bail!("source recording does not support token-id input");
         }
         self.started = true;
         if self.guided.is_none() {
@@ -6934,6 +6993,14 @@ impl UnifiedParser for DebugUnifiedParser {
 
     fn tool_call_id(&self, tool_index: usize) -> Option<&str> {
         self.inner.tool_call_id(tool_index)
+    }
+
+    fn record_sources(&mut self) -> bool {
+        self.inner.record_sources()
+    }
+
+    fn take_sources(&mut self, out: &mut Vec<std::ops::Range<usize>>) {
+        self.inner.take_sources(out)
     }
 }
 

@@ -19,11 +19,15 @@
 //! - [`stop_tokens`]: a tool-call end token that is a hidden EOS becomes a visible stop.
 //! - [`tools`]: the effective tools and the tool-parsing gate.
 //! - [`unified_stream`]: the v2 stream adapter. One unified parser per choice turns
-//!   raw model text into OpenAI reasoning, content, and tool-call chunks.
+//!   raw model text into OpenAI reasoning, content, and tool-call chunks. Also the
+//!   batch parse of a whole reply.
+//! - [`aggregator`]: the non-streaming finalize. The chunks of a `stream: false`
+//!   reply become one response.
 //! - [`stream_item`]: the stream item the adapter reads, so Dynamo keeps its own
 //!   chunk fields.
 //! - [`guided`]: the tool-output grammar a request installed.
 
+pub mod aggregator;
 pub mod families;
 pub mod guided;
 pub mod prefill;

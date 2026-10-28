@@ -4,8 +4,8 @@
 //! The v2 stream adapter: one `dynamo-parsers-v2` `UnifiedParser` per response
 //! choice, mapped onto OpenAI streaming chunks.
 //!
-//! Moved from dynamo `lib/llm/src/protocols/openai/chat_completions/unified_parser.rs`.
-//! The batch path (`parse_complete*`) is not here.
+//! Moved from dynamo `lib/llm/src/protocols/openai/chat_completions/unified_parser.rs`,
+//! with the batch path ([`parse_complete_with_policy`]) that the chat aggregator uses.
 //!
 //! # Why one chunk per delta
 //!
@@ -21,20 +21,21 @@ use async_stream::stream;
 use dynamo_parsers::sources::{ChoiceSources, SourceSlot};
 use dynamo_parsers::tool_calling::ToolDefinition;
 use dynamo_parsers_v2::{
-    InvalidGuidedPayloadPolicy, Tool, UnifiedParser, UnifiedParserEvent, UnifiedParserInit,
-    UnifiedParserOutput, UnifiedParserStartingState, UnifiedToolOutputMode,
+    InvalidGuidedPayloadPolicy, Tool, UnifiedEvent, UnifiedParser, UnifiedParserEvent,
+    UnifiedParserInit, UnifiedParserOutput, UnifiedParserStartingState, UnifiedToolOutputMode,
     create_unified_parser_for_family,
 };
 use dynamo_protocols::types::{
-    ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCallChunk,
-    ChatCompletionStreamResponseDelta, FinishReason, FunctionCallStream, FunctionType,
+    ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCall,
+    ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta, FinishReason,
+    FunctionCall, FunctionCallStream, FunctionType,
 };
 use futures::{Stream, StreamExt};
 use uuid::Uuid;
 
 use crate::families::{
-    DEEPSEEK_V41_UNIFIED_FAMILY, GLM47_UNIFIED_FAMILY, MUSE_UNIFIED_FAMILY, QWEN3_TOOL_CALL_PARSER,
-    QWEN3_UNIFIED_FAMILY,
+    DEEPSEEK_V41_UNIFIED_FAMILY, GLM47_UNIFIED_FAMILY, KIMI_K3_UNIFIED_FAMILY, MUSE_UNIFIED_FAMILY,
+    QWEN3_TOOL_CALL_PARSER, QWEN3_UNIFIED_FAMILY,
 };
 use crate::guided::GuidedToolConstraint;
 use crate::spans::{FeedMap, Spans, append_spans, spans_len, split_spans};
@@ -70,6 +71,22 @@ impl UnifiedRequestPolicy {
 
     fn inspects_json_prefill(self, constraint: &GuidedToolConstraint) -> bool {
         self.structured_response || constraint.installs_guided_json()
+    }
+
+    fn batch_starting_state(
+        self,
+        family: &str,
+        content: &str,
+    ) -> anyhow::Result<UnifiedParserStartingState> {
+        let inferred = if self.structured_response
+            && structured_json_response_prefill(family, content, true)?
+                == Some(UnifiedParserStartingState::Response)
+        {
+            UnifiedParserStartingState::Response
+        } else {
+            detect_prefill(family, content)?
+        };
+        Ok(self.starting_state(family, inferred))
     }
 }
 
@@ -847,6 +864,37 @@ fn invalid_guided_payload_policy(guided_streaming: bool) -> InvalidGuidedPayload
     }
 }
 
+/// Select the complete-output grammar from the bytes that actually arrived.
+///
+/// A remote frontend can reconstruct a forced request as guided JSON without seeing
+/// that the worker installed a structural tag. Prefer the configured family's native
+/// marker over the reconstructed request policy; quoted markers remain payload.
+fn batch_tool_output_mode(
+    family: &str,
+    content: &str,
+    constraint: &GuidedToolConstraint,
+) -> UnifiedToolOutputMode {
+    let tool_parser = if family == QWEN3_UNIFIED_FAMILY {
+        QWEN3_TOOL_CALL_PARSER
+    } else {
+        family
+    };
+    // Kimi K3's jail also owns reasoning and response boundaries. Those
+    // envelopes can precede guided JSON and do not prove a native tool call.
+    let native_call = if family == KIMI_K3_UNIFIED_FAMILY {
+        ["call", "tools"]
+            .into_iter()
+            .any(|channel| kimi_channel_marker_position(content, "<|open|>", channel).is_some())
+    } else {
+        first_unquoted_native_tool_call_marker(content, tool_parser).is_some()
+    };
+    if constraint.installs_guided_json() && native_call {
+        UnifiedToolOutputMode::Native
+    } else {
+        tool_output_mode(constraint)
+    }
+}
+
 /// Ask the grammar owner which source bytes remain uncommitted. A literal tool
 /// closer inside an argument must not hide an unfinished sibling from recovery.
 fn glm_unfinished_call(input: &str) -> anyhow::Result<Option<usize>> {
@@ -878,6 +926,13 @@ fn glm_unfinished_call(input: &str) -> anyhow::Result<Option<usize>> {
         .filter_map(|marker| first_unquoted_marker_position_after(&prose, marker, pending_offset))
         .min()
         .map(|start| prefix.len() + start - pending_offset))
+}
+
+#[cfg(test)]
+fn contains_native_envelope(content: &str, family: &str) -> bool {
+    unified_parser_control_markers(family)
+        .iter()
+        .any(|marker| contains_unquoted_marker(content, marker))
 }
 
 fn unified_parser_control_markers(family: &str) -> Vec<String> {
@@ -2465,6 +2520,208 @@ fn normalize_passthrough_tool_call(
     tool_index
 }
 
+/// The aggregated result of parsing one complete (non-streaming) output.
+pub struct CompleteOutput {
+    pub incomplete_native_call: bool,
+    pub text: String,
+    pub reasoning: String,
+    pub tool_calls: Vec<ChatCompletionMessageToolCall>,
+}
+
+/// Batch (non-streaming) path: run the whole output through the same parser lifecycle
+/// and fold the assembled events into the final message.
+///
+/// Routing batch through `push`/`finish` is what makes stream/batch parity structural
+/// rather than a property two code paths have to agree on.
+///
+/// Reasoning spans are concatenated because the non-streaming message schema has ONE
+/// `reasoning_content` string — the ordering the unified parser recovered survives only
+/// on the streaming path, which is where a client can act on it.
+#[cfg(test)]
+pub(crate) fn parse_complete(
+    family: &str,
+    content: &str,
+    guided_tool_constraint: &GuidedToolConstraint,
+    tool_definitions: &[ToolDefinition],
+) -> anyhow::Result<CompleteOutput> {
+    parse_complete_with_policy(
+        family,
+        content,
+        guided_tool_constraint,
+        tool_definitions,
+        UnifiedRequestPolicy::default(),
+    )
+}
+
+pub fn parse_complete_with_policy(
+    family: &str,
+    content: &str,
+    guided_tool_constraint: &GuidedToolConstraint,
+    tool_definitions: &[ToolDefinition],
+    policy: UnifiedRequestPolicy,
+) -> anyhow::Result<CompleteOutput> {
+    // A remote frontend may reconstruct guided JSON even when the backend returned
+    // native reasoning/content without a tool call. Keep that recovery under the
+    // same grammar owner as ordinary native batch output.
+    let mode = batch_tool_output_mode(family, content, guided_tool_constraint);
+    match parse_complete_in_mode(
+        family,
+        content,
+        guided_tool_constraint,
+        tool_definitions,
+        mode.clone(),
+        policy,
+    ) {
+        Err(guided_error) if !matches!(mode, UnifiedToolOutputMode::Native) => {
+            match parse_complete_in_mode(
+                family,
+                content,
+                guided_tool_constraint,
+                tool_definitions,
+                UnifiedToolOutputMode::Native,
+                policy,
+            ) {
+                Ok(parsed)
+                    if !parsed.tool_calls.is_empty()
+                        || !parsed.reasoning.is_empty()
+                        || parsed.text != content =>
+                {
+                    tracing::warn!(
+                        family,
+                        why = "guided_json_reconstructed_but_native_markup_observed",
+                        recovered_bytes = content.len(),
+                        "falling back to the configured unified parser"
+                    );
+                    Ok(parsed)
+                }
+                Ok(_) => Err(guided_error),
+                Err(native_error) => Err(native_error
+                    .context(format!("guided JSON parse also failed: {guided_error:#}"))),
+            }
+        }
+        result => result,
+    }
+}
+
+fn parse_complete_in_mode(
+    family: &str,
+    content: &str,
+    guided_tool_constraint: &GuidedToolConstraint,
+    tool_definitions: &[ToolDefinition],
+    effective_mode: UnifiedToolOutputMode,
+    policy: UnifiedRequestPolicy,
+) -> anyhow::Result<CompleteOutput> {
+    let tools = to_v2_tools(Some(tool_definitions));
+    let mut parser = create_unified_parser_for_family(family, &tools)?;
+    // `batch_tool_output_mode` drops to `Native` on observed markup even when the
+    // constraint reconstructed a `GuidedJsonNamed` pin. That native fallback recovers
+    // whatever tool name the markup happens to contain, so it must be checked against
+    // the forced name below instead of trusted unfiltered — a malformed guided output
+    // that embeds a *different* tool's markup must not be handed back as the pinned
+    // tool's call.
+    let forced_tool_name = match (guided_tool_constraint, &effective_mode) {
+        (GuidedToolConstraint::GuidedJsonNamed { tool_name }, UnifiedToolOutputMode::Native) => {
+            Some(tool_name.as_str())
+        }
+        _ => None,
+    };
+    let incomplete_start = (family == GLM47_UNIFIED_FAMILY
+        && matches!(&effective_mode, UnifiedToolOutputMode::Native))
+    .then(|| glm_unfinished_call(content))
+    .transpose()?
+    .flatten();
+    let content = &content[..incomplete_start.unwrap_or(content.len())];
+    parser.initialize_request(UnifiedParserInit {
+        prompt_token_ids: if family == "gpt_oss"
+            && matches!(&effective_mode, UnifiedToolOutputMode::Native)
+            && content.trim_start().starts_with("to=")
+        {
+            dynamo_parsers_v2::unified::harmony::encode_harmony("<|start|>assistant")?
+        } else {
+            Vec::new()
+        },
+        starting_state: policy.batch_starting_state(family, content)?,
+        tool_output_mode: effective_mode,
+        ..UnifiedParserInit::default()
+    })?;
+
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    let mut output = UnifiedParserOutput::default();
+    parser.parse_into(content, &mut output)?;
+    output.events.extend(parser.finish()?.events);
+    let completed_indices: HashSet<_> = output
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            UnifiedParserEvent::ToolCall(call) if call.complete => Some(call.tool_index),
+            _ => None,
+        })
+        .collect();
+    let mut seen = HashSet::new();
+    let mut completed_indices = output.events.iter().filter_map(|event| match event {
+        UnifiedParserEvent::ToolCall(call)
+            if completed_indices.contains(&call.tool_index) && seen.insert(call.tool_index) =>
+        {
+            Some(call.tool_index)
+        }
+        _ => None,
+    });
+    let events = dynamo_parsers_v2::assemble(&output.events);
+    for event in events {
+        match event {
+            // As in `delta_to_choice`: this path never turns on message phases.
+            UnifiedEvent::MessageStart { .. } | UnifiedEvent::MessageEnd => {}
+            UnifiedEvent::Text { text: chunk } => text.push_str(&chunk),
+            UnifiedEvent::Reasoning { text: chunk } => {
+                if policy.reasoning_disabled {
+                    text.push_str(&chunk);
+                } else {
+                    reasoning.push_str(&chunk);
+                }
+            }
+            UnifiedEvent::ToolCall { name, arguments } => {
+                let id = parser
+                    .tool_call_id(
+                        completed_indices
+                            .next()
+                            .expect("assembled call has completion evidence"),
+                    )
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("call-{}", Uuid::new_v4()));
+                if forced_tool_name.is_some_and(|forced| forced != name) {
+                    tracing::warn!(
+                        forced_tool_name = forced_tool_name,
+                        recovered_tool_name = %name,
+                        "dropped native-fallback tool call whose name did not match the tool_choice-forced tool_name"
+                    );
+                    continue;
+                }
+                tool_calls.push(ChatCompletionMessageToolCall {
+                    id,
+                    r#type: FunctionType::Function,
+                    // `assemble` already parsed the argument fragments into a typed
+                    // object, so this re-serializes rather than passing the model's
+                    // bytes through. Formatting is normalized as a result.
+                    function: FunctionCall {
+                        name,
+                        arguments: serde_json::to_string(&arguments)?,
+                    },
+                    custom: None,
+                });
+            }
+        }
+    }
+
+    Ok(CompleteOutput {
+        incomplete_native_call: incomplete_start.is_some(),
+        text,
+        reasoning,
+        tool_calls,
+    })
+}
+
 /// Per-choice bookkeeping that outlives any single `ChoiceState` instance for that
 /// index: whether it has emitted a tool call, which indices remain provisional, and whether its terminal chunk has
 /// already been sent. See the field comment at its use site in
@@ -3861,4 +4118,4 @@ where
 
 #[cfg(test)]
 #[path = "unified_stream_tests.rs"]
-mod tests;
+pub(crate) mod tests;

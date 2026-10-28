@@ -30,8 +30,9 @@
 //! On frontend-crates `main`, 16 cases differ in one place each: the
 //! arguments of a tool call with a numeric value. dynamo-parsers-v2 0.8 keeps
 //! a number as the model wrote it (frontend-crates #339), and 0.7.35 did not.
-//! [`PARSERS_V2_0_8_ARGUMENTS`] lists each change. On the 0.7.35 tag, with the
-//! same move applied, every case matches the recording with no change.
+//! The owner accepted 0.8's output as a known difference from stock dynamo.
+//! [`ACCEPTED_0_8_DIFFERENCES`] lists each case by name. On the 0.7.35 tag,
+//! with the same move applied, every case matches the recording with no change.
 //!
 //! Chunks in the file leave out the fixed envelope (`id`, `object`, `created`,
 //! `model`) and null fields. dynamo's `llm_metrics` is written as its
@@ -286,71 +287,213 @@ fn prefix(value: &Value) -> Option<&'static str> {
     Some(&HEADER[..prefix.len()])
 }
 
-/// Tool-call arguments that dynamo-parsers-v2 0.8 writes differently from
-/// 0.7.35, which dynamo used for the recording: (family and scenario, 0.7.35,
-/// 0.8). Each case runs at two chunk sizes. The change is in the parser, not in
-/// this adapter.
-const PARSERS_V2_0_8_ARGUMENTS: &[(&str, &str, &str)] = &[
-    (
-        "deepseek_v4/numeric_exp/",
-        r#"{"count":1000.0,"content":"-0.0"}"#,
-        r#"{"count":1e3,"content":"-0.0"}"#,
-    ),
-    (
-        "deepseek_v41/numeric_exp/",
-        r#"{"count":1000.0,"content":"-0.0"}"#,
-        r#"{"count":1e3,"content":"-0.0"}"#,
-    ),
-    (
-        "glm47/numeric/",
-        r#"{"count":1.0,"path":"n.txt","content":"12345678901234567890"}"#,
-        r#"{"count":1,"path":"n.txt","content":"12345678901234567890"}"#,
-    ),
-    (
-        "glm47/numeric_exp/",
-        r#"{"count":1000.0,"content":"-0.0"}"#,
-        r#"{"count":1000,"content":"-0.0"}"#,
-    ),
-    (
-        "kimi_k2/numeric_exp/",
-        r#"{"count":1000.0,"content":"-0.0"}"#,
-        r#"{"count":1e3,"content":"-0.0"}"#,
-    ),
-    // 0.7.35 dropped these Gemma 4 arguments.
-    (
-        "gemma4/numeric_big/",
-        "{}",
-        r#"{"count":12345678901234567890,"content":"x"}"#,
-    ),
-    (
-        "gemma4/numeric_exp/",
-        "{}",
-        r#"{"count":1e3,"content":"-0.0"}"#,
-    ),
-    (
-        "muse_glimmer/numeric_exp/",
-        r#"{"count":1000.0,"content":-0.0}"#,
-        r#"{"count":1e3,"content":-0.0}"#,
-    ),
+/// The owner's answer on numbers in tool-call arguments: "0.8's output: the
+/// arguments as the model wrote them (1e3 stays 1e3, Gemma 4 gets its real
+/// arguments). Record it as a known difference from stock dynamo, which goes
+/// away when dynamo moves to 0.8."
+const OWNER_ANSWER: &str = "keep dynamo-parsers-v2 0.8's arguments as the model wrote them; \
+    a known difference from stock dynamo until dynamo moves to 0.8";
+
+/// The output field each accepted difference is in.
+const ARGUMENTS: &str = "choices[].delta.tool_calls[].function.arguments";
+
+/// One accepted difference between this crate on frontend-crates `main`
+/// (dynamo-parsers-v2 0.8) and the recording (dynamo-llm on 0.7.35).
+struct Accepted {
+    /// The corpus case name.
+    case: &'static str,
+    /// The output field that differs.
+    field: &'static str,
+    /// The value in dynamo-llm's recorded output.
+    dynamo: &'static str,
+    /// The value on frontend-crates `main`.
+    main: &'static str,
+    /// Why the difference is accepted.
+    why: &'static str,
+}
+
+/// Exactly the cases where dynamo-parsers-v2 0.8 writes a tool call's
+/// arguments differently from 0.7.35: it keeps numbers as the model wrote
+/// them (frontend-crates #339). The change is in the parser, not in this
+/// adapter: on the 0.7.35 tag every case matches the recording. Any other
+/// difference fails `moved_adapter_matches_dynamo_llm`, and
+/// `accepted_differences_are_exactly_the_listed_cases` fails if a case is
+/// added to the differences or drops out of them.
+const ACCEPTED_0_8_DIFFERENCES: &[Accepted] = &[
+    Accepted {
+        case: "core/deepseek_v4/numeric_exp/split0/none",
+        field: ARGUMENTS,
+        dynamo: r#"{"count":1000.0,"content":"-0.0"}"#,
+        main: r#"{"count":1e3,"content":"-0.0"}"#,
+        why: OWNER_ANSWER,
+    },
+    Accepted {
+        case: "core/deepseek_v4/numeric_exp/split4/none",
+        field: ARGUMENTS,
+        dynamo: r#"{"count":1000.0,"content":"-0.0"}"#,
+        main: r#"{"count":1e3,"content":"-0.0"}"#,
+        why: OWNER_ANSWER,
+    },
+    Accepted {
+        case: "core/deepseek_v41/numeric_exp/split0/none",
+        field: ARGUMENTS,
+        dynamo: r#"{"count":1000.0,"content":"-0.0"}"#,
+        main: r#"{"count":1e3,"content":"-0.0"}"#,
+        why: OWNER_ANSWER,
+    },
+    Accepted {
+        case: "core/deepseek_v41/numeric_exp/split4/none",
+        field: ARGUMENTS,
+        dynamo: r#"{"count":1000.0,"content":"-0.0"}"#,
+        main: r#"{"count":1e3,"content":"-0.0"}"#,
+        why: OWNER_ANSWER,
+    },
+    Accepted {
+        case: "core/glm47/numeric/split0/none",
+        field: ARGUMENTS,
+        dynamo: r#"{"count":1.0,"path":"n.txt","content":"12345678901234567890"}"#,
+        main: r#"{"count":1,"path":"n.txt","content":"12345678901234567890"}"#,
+        why: OWNER_ANSWER,
+    },
+    Accepted {
+        case: "core/glm47/numeric/split4/none",
+        field: ARGUMENTS,
+        dynamo: r#"{"count":1.0,"path":"n.txt","content":"12345678901234567890"}"#,
+        main: r#"{"count":1,"path":"n.txt","content":"12345678901234567890"}"#,
+        why: OWNER_ANSWER,
+    },
+    Accepted {
+        case: "core/glm47/numeric_exp/split0/none",
+        field: ARGUMENTS,
+        dynamo: r#"{"count":1000.0,"content":"-0.0"}"#,
+        main: r#"{"count":1000,"content":"-0.0"}"#,
+        why: OWNER_ANSWER,
+    },
+    Accepted {
+        case: "core/glm47/numeric_exp/split4/none",
+        field: ARGUMENTS,
+        dynamo: r#"{"count":1000.0,"content":"-0.0"}"#,
+        main: r#"{"count":1000,"content":"-0.0"}"#,
+        why: OWNER_ANSWER,
+    },
+    Accepted {
+        case: "core/kimi_k2/numeric_exp/split0/none",
+        field: ARGUMENTS,
+        dynamo: r#"{"count":1000.0,"content":"-0.0"}"#,
+        main: r#"{"count":1e3,"content":"-0.0"}"#,
+        why: OWNER_ANSWER,
+    },
+    Accepted {
+        case: "core/kimi_k2/numeric_exp/split4/none",
+        field: ARGUMENTS,
+        dynamo: r#"{"count":1000.0,"content":"-0.0"}"#,
+        main: r#"{"count":1e3,"content":"-0.0"}"#,
+        why: OWNER_ANSWER,
+    },
+    // Gemma 4 on 0.7.35 dropped these arguments.
+    Accepted {
+        case: "core/gemma4/numeric_big/split0/none",
+        field: ARGUMENTS,
+        dynamo: r#"{}"#,
+        main: r#"{"count":12345678901234567890,"content":"x"}"#,
+        why: OWNER_ANSWER,
+    },
+    Accepted {
+        case: "core/gemma4/numeric_big/split4/none",
+        field: ARGUMENTS,
+        dynamo: r#"{}"#,
+        main: r#"{"count":12345678901234567890,"content":"x"}"#,
+        why: OWNER_ANSWER,
+    },
+    // Gemma 4 on 0.7.35 dropped these arguments.
+    Accepted {
+        case: "core/gemma4/numeric_exp/split0/none",
+        field: ARGUMENTS,
+        dynamo: r#"{}"#,
+        main: r#"{"count":1e3,"content":"-0.0"}"#,
+        why: OWNER_ANSWER,
+    },
+    Accepted {
+        case: "core/gemma4/numeric_exp/split4/none",
+        field: ARGUMENTS,
+        dynamo: r#"{}"#,
+        main: r#"{"count":1e3,"content":"-0.0"}"#,
+        why: OWNER_ANSWER,
+    },
+    Accepted {
+        case: "core/muse_glimmer/numeric_exp/split0/none",
+        field: ARGUMENTS,
+        dynamo: r#"{"count":1000.0,"content":-0.0}"#,
+        main: r#"{"count":1e3,"content":-0.0}"#,
+        why: OWNER_ANSWER,
+    },
+    Accepted {
+        case: "core/muse_glimmer/numeric_exp/split4/none",
+        field: ARGUMENTS,
+        dynamo: r#"{"count":1000.0,"content":-0.0}"#,
+        main: r#"{"count":1e3,"content":-0.0}"#,
+        why: OWNER_ANSWER,
+    },
 ];
 
-/// The recorded output, with the arguments that dynamo-parsers-v2 0.8 changes.
-fn expected_on_main(name: &str, recorded: &Value) -> Value {
-    let Some((_, old, new)) = PARSERS_V2_0_8_ARGUMENTS
+fn accepted(name: &str) -> Option<&'static Accepted> {
+    ACCEPTED_0_8_DIFFERENCES
         .iter()
-        .find(|(case, _, _)| name.starts_with(&format!("core/{case}")))
-    else {
+        .find(|accepted| accepted.case == name)
+}
+
+/// The tool-call arguments in an output, joined in order.
+fn arguments(output: &Value) -> String {
+    output
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.pointer("/data/choices"))
+        .flat_map(|choices| choices.as_array().into_iter().flatten())
+        .filter_map(|choice| choice.pointer("/delta/tool_calls"))
+        .flat_map(|calls| calls.as_array().into_iter().flatten())
+        .filter_map(|call| call.pointer("/function/arguments").and_then(Value::as_str))
+        .collect()
+}
+
+/// The recorded output, with an accepted case's arguments as 0.8 writes them.
+fn expected_on_main(name: &str, recorded: &Value) -> Value {
+    let Some(accepted) = accepted(name) else {
         return recorded.clone();
     };
-    let text = serde_json::to_string(recorded).expect("serialize output");
-    let old = serde_json::to_string(old).expect("quote");
+    assert_eq!(accepted.field, ARGUMENTS);
+    let mut expected = recorded.clone();
+    let mut replaced = 0;
+    for item in expected.as_array_mut().into_iter().flatten() {
+        let Some(choices) = item
+            .pointer_mut("/data/choices")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for choice in choices {
+            let Some(calls) = choice
+                .pointer_mut("/delta/tool_calls")
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            for call in calls {
+                if let Some(arguments) = call.pointer_mut("/function/arguments")
+                    && arguments == accepted.dynamo
+                {
+                    *arguments = json!(accepted.main);
+                    replaced += 1;
+                }
+            }
+        }
+    }
     assert_eq!(
-        text.matches(&old).count(),
-        1,
-        "{name}: arguments appear once"
+        replaced, 1,
+        "{name}: the recorded arguments {} appear once",
+        accepted.dynamo
     );
-    let new = serde_json::to_string(new).expect("quote");
-    serde_json::from_str(&text.replace(&old, &new)).expect("parse output")
+    expected
 }
 
 fn run(case: &Value, parsers_v2_selected: bool) -> Vec<Value> {
@@ -556,5 +699,55 @@ fn non_data_annotations_survive_between_native_fragments() {
             item.pointer("/data/choices/0/delta/tool_calls/0/function/name")
                 == Some(&json!("get_weather"))
         }));
+    }
+}
+
+/// The accepted differences are exactly the listed cases, with either parser
+/// version selection: a 17th case that differs from the recording fails, and so
+/// does a listed case that matches 0.7.35 again or gives other arguments.
+#[test]
+fn accepted_differences_are_exactly_the_listed_cases() {
+    let cases = fixture();
+    let mut v2_outputs = std::collections::HashMap::new();
+    for case in &cases {
+        if case["parsers_v2_selected"] == json!(true) {
+            v2_outputs.insert(case["name"].as_str().unwrap().to_string(), &case["output"]);
+        }
+    }
+    let listed: std::collections::BTreeSet<&str> = ACCEPTED_0_8_DIFFERENCES
+        .iter()
+        .map(|accepted| accepted.case)
+        .collect();
+    assert_eq!(listed.len(), 16, "each case is listed once");
+    for accepted in ACCEPTED_0_8_DIFFERENCES {
+        assert!(!accepted.why.is_empty());
+        assert_ne!(accepted.dynamo, accepted.main, "{}", accepted.case);
+    }
+    for parsers_v2_selected in [false, true] {
+        let mut differing = std::collections::BTreeSet::new();
+        for case in cases
+            .iter()
+            .filter(|case| case["parsers_v2_selected"] == json!(false))
+        {
+            let name = case["name"].as_str().unwrap();
+            let recorded = match (parsers_v2_selected, v2_outputs.get(name)) {
+                (true, Some(output)) => *output,
+                _ => &case["output"],
+            };
+            let actual = Value::Array(run(case, parsers_v2_selected));
+            if &actual != recorded {
+                differing.insert(name.to_string());
+            }
+            if let Some(accepted) = accepted(name) {
+                assert_eq!(arguments(recorded), accepted.dynamo, "{name}: recorded");
+                assert_eq!(arguments(&actual), accepted.main, "{name}: on main");
+            }
+        }
+        let differing: std::collections::BTreeSet<&str> =
+            differing.iter().map(String::as_str).collect();
+        assert_eq!(
+            differing, listed,
+            "parsers_v2_selected={parsers_v2_selected}: the cases that differ from the recording"
+        );
     }
 }
