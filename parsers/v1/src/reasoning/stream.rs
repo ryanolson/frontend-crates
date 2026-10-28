@@ -19,9 +19,9 @@ use std::pin::Pin;
 use dynamo_protocols::types::ChatCompletionMessageContent;
 use futures::{Stream, StreamExt, stream};
 
-use crate::chat_stream::{ChatStreamItem, choice_texts};
+use crate::chat_stream::{ChatStreamItem, match_chunk_sources};
 use crate::reasoning::{ParserResult, ReasoningParser, ReasoningParserType};
-use crate::sources::{ChoiceSources, SourceChannel, SourceRun, Spans, match_choice_sources};
+use crate::sources::{ChoiceSources, SourceChannel, SourceRun, Spans};
 
 /// Options for [`parse_reasoning_content_from_stream`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -912,14 +912,12 @@ where
 }
 
 /// While the item records, takes its input entries out of its slot and pairs
-/// them with its choices; see [`match_choice_sources`]. `None` when the item has
+/// them with its choices; see [`match_chunk_sources`]. `None` when the item has
 /// no slot.
 fn match_input_sources<T: ChatStreamItem>(response: &mut T) -> Option<Vec<Option<ChoiceSources>>> {
     let entries = std::mem::take(response.sources_mut()?);
-    let texts = response
-        .chunk()
-        .map_or_else(Vec::new, |data| choice_texts(&data.choices));
-    Some(match_choice_sources(entries, &texts))
+    let choices = response.chunk().map_or(&[][..], |data| &data.choices[..]);
+    Some(match_chunk_sources(entries, choices))
 }
 
 /// [`Spans`] of the caller's ranges.

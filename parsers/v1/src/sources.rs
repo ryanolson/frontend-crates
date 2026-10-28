@@ -90,16 +90,18 @@ pub fn match_choice_sources(
         };
         for at in paired {
             let entry = group.pop_front().expect("one entry per paired choice");
-            let len =
-                |ranges: &[Range<usize>]| ranges.iter().map(|range| range.len()).sum::<usize>();
-            if len(&entry.content) == choices[at].content_len
-                && len(&entry.reasoning) == choices[at].reasoning_len
-            {
+            if entry_covers(&entry, &choices[at]) {
                 out[at] = Some(entry);
             }
         }
     }
     out
+}
+
+/// Whether `entry`'s ranges cover `choice`'s text lengths exactly.
+pub(crate) fn entry_covers(entry: &ChoiceSources, choice: &ChoiceText) -> bool {
+    let len = |ranges: &[Range<usize>]| ranges.iter().map(|range| range.len()).sum::<usize>();
+    len(&entry.content) == choice.content_len && len(&entry.reasoning) == choice.reasoning_len
 }
 
 /// Which field of a reasoning parser's result a run of text went to.
