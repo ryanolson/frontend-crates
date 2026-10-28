@@ -1416,3 +1416,29 @@ fn f5_source_checker_accepts_reordered_exact_ranges() {
     assert_eq!(read(&texts[&0], &reasoning).as_deref(), Some("B<C"));
     check_sources(&output, &texts).unwrap();
 }
+
+#[test]
+#[ignore = "F6: the order rule accepts the first reasoning run inside a stripped opener"]
+fn f6_source_checker_rejects_a_first_run_inside_the_opener() {
+    let _parser = ParserOverride::install(false);
+    let (input, texts) = with_slots(&[text_chunk(0, Some("<think>think</think>"), None, true)]);
+    let mut output = Request::native("qwen3").run(input);
+    check_sources(&output, &texts).unwrap();
+    assert_eq!(&texts[&0][1..6], "think");
+    assert_eq!(&texts[&0][7..12], "think");
+    let mut changed = 0;
+    for data in output.iter_mut().filter_map(|item| item.data.as_mut()) {
+        for entry in &mut data.slot {
+            for range in &mut entry.reasoning {
+                assert_eq!(*range, 7..12);
+                *range = 1..6;
+                changed += 1;
+            }
+        }
+    }
+    assert_eq!(changed, 1);
+    assert!(
+        check_sources(&output, &texts).is_err(),
+        "accepted stripped opener 1..6 instead of reasoning 7..12"
+    );
+}
