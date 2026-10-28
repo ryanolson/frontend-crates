@@ -618,13 +618,14 @@ fn no_content_passed_through(output: &[Recorded]) -> bool {
 
 #[test]
 fn a_parser_that_cannot_record_fails_the_stream() {
-    // No override: the real family parser keeps the trait default and refuses.
+    // No override: Kimi K3's real parser cannot record exact ranges, so it
+    // refuses.
     let (input, _) = with_slots(&split("<think>r</think>visible text", 4));
-    let output = Request::native("glm47").run(input);
+    let output = Request::native("kimi_k3").run(input);
     assert!(ends_with_error(&output), "{output:?}");
     assert!(no_content_passed_through(&output), "{output:?}");
     // The stock path is unchanged: the same input without slots parses.
-    let plain = Request::native("glm47").run(split("<think>r</think>visible text", 4));
+    let plain = Request::native("kimi_k3").run(split("<think>r</think>visible text", 4));
     assert!(!plain.iter().any(Annotated::is_error));
 }
 
@@ -818,11 +819,14 @@ fn the_corpus_records_without_changing_a_chunk() {
     assert_eq!(prefix_refused, 16, "{prefix_refused} prefix cases refused");
 }
 
-/// The same with the real parsers. It enforces nothing until the
-/// `dynamo-parsers-v2` families implement `record_sources`.
+/// The same with the real parsers. Some refuse to record by design: Kimi K3
+/// and Muse Glimmer always, and Gemma 4 when the prompt prefix ends inside the
+/// `thought` label, because those held prompt bytes can surface as output.
+/// Each must refuse when the stream starts, before any output. Tool-call ids
+/// are random, so they are compared by shape.
 #[test]
-#[ignore = "needs record_sources in dynamo-parsers-v2"]
 fn the_corpus_records_with_the_real_parsers() {
+    let (mut checked, mut refused, mut gemma_refused) = (0, 0, 0);
     for case in corpus() {
         let request = corpus_request(&case);
         if request.constraint.installs_guided_json() {
@@ -834,16 +838,82 @@ fn the_corpus_records_with_the_real_parsers() {
             .iter()
             .map(corpus_item)
             .collect();
-        let expected: Vec<_> = request.run(input.clone()).iter().map(plain_key).collect();
+        let name = case["name"].as_str().unwrap();
         let (slotted, texts) = with_slots(&input);
         let output = request.run(slotted);
-        let actual: Vec<_> = output.iter().map(without_slot).collect();
-        let name = case["name"].as_str().unwrap();
+        let partial_label = name
+            .strip_prefix("gemma_prefix/")
+            .and_then(|rest| rest.split('/').next())
+            .is_some_and(|end| end != "<|channel>".len().to_string());
+        if partial_label || matches!(case["family"].as_str(), Some("kimi_k3" | "muse_glimmer")) {
+            let delta_text = output
+                .iter()
+                .filter_map(|item| item.data.as_ref())
+                .flat_map(|data| &data.chunk.inner.choices)
+                .any(|choice| {
+                    text_len(choice.delta.content.as_ref()) > 0
+                        || choice
+                            .delta
+                            .reasoning_content
+                            .as_deref()
+                            .is_some_and(|text| !text.is_empty())
+                        || choice.delta.tool_calls.is_some()
+                });
+            assert!(
+                !delta_text,
+                "{name}: the refusal came after output: {output:?}"
+            );
+            assert!(
+                output.iter().any(|item| item
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("cannot record sources"))),
+                "{name}: expected a refusal"
+            );
+            refused += 1;
+            gemma_refused += usize::from(partial_label);
+            continue;
+        }
+        let expected: Vec<_> = request
+            .run(input)
+            .iter()
+            .map(|item| id_shape(plain_key(item)))
+            .collect();
+        let actual: Vec<_> = output
+            .iter()
+            .map(|item| id_shape(without_slot(item)))
+            .collect();
         assert_eq!(actual, expected, "{name}: recording changed the chunks");
         if let Err(error) = check_sources(&output, &texts) {
             panic!("{name}: {error}");
         }
+        checked += 1;
     }
+    assert!(checked > 900, "{checked} cases checked");
+    assert!(refused > 200, "{refused} cases refused");
+    // Prefix ends 11 to 17, each with two outputs.
+    assert_eq!(
+        gemma_refused, 14,
+        "{gemma_refused} Gemma prefix cases refused"
+    );
+}
+
+/// A chunk key with each generated tool-call id written as `call-*`.
+fn id_shape(
+    mut key: (Option<NvCreateChatCompletionStreamResponse>, String),
+) -> (Option<NvCreateChatCompletionStreamResponse>, String) {
+    let calls = key
+        .0
+        .iter_mut()
+        .flat_map(|chunk| chunk.inner.choices.iter_mut())
+        .filter_map(|choice| choice.delta.tool_calls.as_mut())
+        .flatten();
+    for call in calls {
+        if call.id.as_deref().is_some_and(|id| id.starts_with("call-")) {
+            call.id = Some("call-*".to_string());
+        }
+    }
+    key
 }
 
 /// A parser that fails to start is not a recording refusal. The stock path
