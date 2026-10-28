@@ -458,9 +458,10 @@ pub trait UnifiedParser: Send {
     /// [`Self::parse_into`] since recording was turned on, and keep counting
     /// across [`Self::reset`] and a new request. Returns `false` when this parser
     /// cannot record exact ranges, so the caller can refuse the request. Guided
-    /// tool output never records. A replayed prefix that leaves bytes held (an
-    /// unfinished Gemma 4 `<|channel>thought` label) refuses too: those prompt
-    /// bytes can surface as output, and they have no offset in the generated text.
+    /// tool output never records. A replayed prefix that leaves bytes held (any
+    /// part of Gemma 4's `<|channel>thought\n` header short of the whole, a bare
+    /// `<|channel>` included) refuses too: those prompt bytes can surface as
+    /// output, and they have no offset in the generated text.
     ///
     /// The families on the shared scanner and GPT-OSS record. Kimi K3, Muse
     /// Glimmer, and Muse Spark return `false`.
