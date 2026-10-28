@@ -527,3 +527,105 @@ async fn the_policy_source_checker_accepts_exact_ranges_out_of_input_order() {
         failures.len()
     );
 }
+
+/// Cost of the v2 adapter and the response policies, stock and recording,
+/// per input chunk. Ignored by default.
+///
+/// The recorded corpus's cases for one family, with no guided tools, through
+/// `apply_stream_with_policy` and then the response policies, with items that
+/// carry no slot and with items that carry one entry per choice. The inputs
+/// are built before the timed passes, which copy them, as the other cost
+/// guards do.
+///
+/// ```text
+/// cargo test --release -p dynamo-chat-parsing --lib -- --ignored --nocapture --exact chat_stream::sources_end_to_end_tests::v2_adapter_cost
+/// ```
+#[test]
+#[ignore = "cost guard: run with --release on a quiet host"]
+fn v2_adapter_cost() {
+    use std::time::{Duration, Instant};
+    const ROUNDS: usize = 15;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    for family in ["qwen3", "glm47"] {
+        let cases: Vec<Value> = corpus()
+            .into_iter()
+            .filter(|case| case["family"] == family)
+            .filter(|case| {
+                let constraint: GuidedToolConstraint =
+                    serde_json::from_value(case["constraint"].clone()).unwrap();
+                !constraint.installs_guided_json() && !refuses_by_design(case)
+            })
+            .collect();
+        for record in [false, true] {
+            let inputs: Vec<(Value, Vec<Annotated<Slot>>)> = cases
+                .iter()
+                .map(|case| (case.clone(), input(case, record).0))
+                .collect();
+            let chunks: usize = inputs.iter().map(|(_, items)| items.len()).sum();
+            let pass = || {
+                runtime.block_on(async {
+                    for (case, items) in &inputs {
+                        let constraint: GuidedToolConstraint =
+                            serde_json::from_value(case["constraint"].clone()).unwrap();
+                        let prefill = StreamPrefill {
+                            starting_state: match case["prefill"].as_str().unwrap() {
+                                "reasoning" => UnifiedParserStartingState::Reasoning,
+                                "response" => UnifiedParserStartingState::Response,
+                                _ => UnifiedParserStartingState::None,
+                            },
+                            prefix: None,
+                        };
+                        let adapted = apply_stream_with_policy(
+                            futures::stream::iter(items.clone()),
+                            case["tools"].as_bool().unwrap().then(weather_tools),
+                            constraint,
+                            prefill,
+                            family,
+                            case["guided_streaming"].as_bool().unwrap(),
+                            UnifiedRequestPolicy {
+                                reasoning_disabled: case["reasoning_disabled"].as_bool().unwrap(),
+                                structured_response: case["structured_response"].as_bool().unwrap(),
+                                parsers_v2_selected: false,
+                            },
+                        )
+                        .map(|item: Annotated<Slot>| {
+                            let (data, sources) = match item.data {
+                                Some(slot) => (Some(slot.inner), slot.slot),
+                                None => (None, None),
+                            };
+                            SourcedChunk {
+                                chunk: Annotated {
+                                    data,
+                                    id: item.id,
+                                    event: item.event,
+                                    comment: item.comment,
+                                    error: item.error,
+                                },
+                                sources,
+                            }
+                        });
+                        let out: Vec<SourcedChunk> =
+                            apply_unified_response_policies(adapted, true, false, false)
+                                .collect()
+                                .await;
+                        std::hint::black_box(out);
+                    }
+                })
+            };
+            pass();
+            let mut times: Vec<Duration> = (0..ROUNDS)
+                .map(|_| {
+                    let start = Instant::now();
+                    pass();
+                    start.elapsed()
+                })
+                .collect();
+            times.sort();
+            let ns = times[ROUNDS / 2].as_nanos() as f64 / chunks as f64;
+            let side = if record { "recording" } else { "stock" };
+            println!("v2 adapter {family}, {side}: {ns:.1} ns/chunk");
+        }
+    }
+}

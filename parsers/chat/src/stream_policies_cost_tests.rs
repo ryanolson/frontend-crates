@@ -122,3 +122,73 @@ fn stream_policies_cost() {
     println!("fold reasoning into content, stock: {fold:.1} ns/chunk");
     println!("force_nonempty_content deferral, stock: {defer:.1} ns/chunk");
 }
+
+/// The same streams with recording on: each chunk carries one entry with one
+/// range, for its reasoning or its content.
+#[allow(clippy::single_range_in_vec_init)]
+fn sourced_streams() -> Vec<Vec<dynamo_parsers::chat_stream::SourcedChunk>> {
+    use dynamo_parsers::chat_stream::SourcedChunk;
+    use dynamo_parsers::sources::ChoiceSources;
+    use dynamo_protocols::types::ChatCompletionMessageContent;
+    streams()
+        .into_iter()
+        .map(|items| {
+            let mut offset = 0;
+            items
+                .into_iter()
+                .map(|item| {
+                    let mut sources = ChoiceSources::default();
+                    if let Some(choice) = item.data.as_ref().and_then(|data| data.choices.first()) {
+                        if let Some(reasoning) = &choice.delta.reasoning_content {
+                            sources.reasoning = vec![offset..offset + reasoning.len()];
+                            offset += reasoning.len();
+                        }
+                        if let Some(ChatCompletionMessageContent::Text(text)) =
+                            &choice.delta.content
+                        {
+                            sources.content = vec![offset..offset + text.len()];
+                            offset += text.len();
+                        }
+                    }
+                    SourcedChunk {
+                        chunk: item,
+                        sources: Some(vec![sources]),
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "cost guard: run with --release on a quiet host"]
+fn stream_policies_cost_on() {
+    let streams = sourced_streams();
+    let chunks: usize = streams.iter().map(Vec::len).sum();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let fold = median_ns_per_chunk(chunks, || {
+        runtime.block_on(async {
+            for items in &streams {
+                let out: Vec<_> = fold_reasoning_into_content(stream::iter(items.clone()), true)
+                    .collect()
+                    .await;
+                std::hint::black_box(out);
+            }
+        })
+    });
+    let defer = median_ns_per_chunk(chunks, || {
+        runtime.block_on(async {
+            for items in &streams {
+                let out: Vec<_> =
+                    defer_unified_reasoning_for_nonempty_content(stream::iter(items.clone()))
+                        .collect()
+                        .await;
+                std::hint::black_box(out);
+            }
+        })
+    });
+    println!("fold reasoning into content, recording: {fold:.1} ns/chunk");
+    println!("force_nonempty_content deferral, recording: {defer:.1} ns/chunk");
+}
