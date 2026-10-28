@@ -25,6 +25,8 @@ pub(crate) fn allocations() -> usize {
 }
 
 /// The bytes this thread has allocated so far.
+// Only some tests bound bytes; a crate built without them never reads it.
+#[allow(dead_code)]
 pub(crate) fn bytes() -> usize {
     BYTES.with(Cell::get)
 }
