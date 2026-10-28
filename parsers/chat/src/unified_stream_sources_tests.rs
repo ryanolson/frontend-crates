@@ -1383,3 +1383,36 @@ fn disabling_sources_before_usage_flush_refuses_undated_held_text() {
             })
     );
 }
+
+#[test]
+#[ignore = "F5: the order rule rejects exact ranges after upstream reasoning precedes a held byte"]
+fn f5_source_checker_accepts_reordered_exact_ranges() {
+    let _parser = ParserOverride::install(false);
+    let request = Request::native("qwen3");
+    let plain = vec![
+        text_chunk(0, Some("<think><"), None, false),
+        text_chunk(0, Some("C</think>D"), Some("B"), true),
+    ];
+    let stock: Vec<_> = request.run(plain.clone()).iter().map(plain_key).collect();
+    let (input, texts) = with_slots(&plain);
+    let output = request.run(input);
+    assert_eq!(output.iter().map(without_slot).collect::<Vec<_>>(), stock);
+    assert_eq!(&texts[&0], "<think><BC</think>D");
+    let entries: Vec<_> = output
+        .iter()
+        .filter_map(|item| item.data.as_ref())
+        .flat_map(|data| &data.slot)
+        .collect();
+    let reasoning: Vec<_> = entries
+        .iter()
+        .flat_map(|entry| entry.reasoning.iter().cloned())
+        .collect();
+    let content: Vec<_> = entries
+        .iter()
+        .flat_map(|entry| entry.content.iter().cloned())
+        .collect();
+    assert_eq!(reasoning, vec![8..9, 7..8, 9..10]);
+    assert_eq!(content, vec![18..19]);
+    assert_eq!(read(&texts[&0], &reasoning).as_deref(), Some("B<C"));
+    check_sources(&output, &texts).unwrap();
+}
