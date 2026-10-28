@@ -11,8 +11,8 @@
 
 use std::collections::HashSet;
 
-use dynamo_parsers::chat_stream::{ChatStreamItem, choice_texts};
-use dynamo_parsers::sources::{ChoiceSources, match_choice_sources};
+use dynamo_parsers::chat_stream::{ChatStreamItem, choice_text, into_entries, match_chunk_sources};
+use dynamo_parsers::sources::ChoiceSources;
 use dynamo_protocols::types::{
     ChatChoiceStream, ChatCompletionMessageContent, CreateChatCompletionRequest,
 };
@@ -217,14 +217,11 @@ where
             }
             return response;
         };
-        let texts = response
-            .chunk()
-            .map_or_else(Vec::new, |data| choice_texts(&data.choices));
-        let mut matched = match_choice_sources(entries, &texts);
-        let mut output = Vec::new();
+        let choices = response.chunk().map_or(&[][..], |data| &data.choices[..]);
+        let mut matched = match_chunk_sources(entries, choices);
         if let Some(data) = response.chunk_mut() {
             for (position, choice) in data.choices.iter_mut().enumerate() {
-                let text = texts[position];
+                let text = choice_text(choice);
                 let mut entry = matched[position].take();
                 if entry.is_none() && text.content_len + text.reasoning_len > 0 {
                     unsourced.insert(choice.index);
@@ -242,15 +239,23 @@ where
                     && fold_choice(choice)
                     && let Some(entry) = entry.as_mut()
                 {
-                    let mut content = std::mem::take(&mut entry.reasoning);
-                    content.append(&mut entry.content);
-                    entry.content = content;
+                    // Keep whichever list holds ranges, so one-range text
+                    // needs no new list.
+                    if entry.content.is_empty() {
+                        entry.content = std::mem::take(&mut entry.reasoning);
+                    } else if !entry.reasoning.is_empty() {
+                        let mut content = std::mem::take(&mut entry.reasoning);
+                        content.append(&mut entry.content);
+                        entry.content = content;
+                    }
                 }
-                output.extend(entry);
+                // Back at its position, so the output list reuses the
+                // input's, in choice order.
+                matched[position] = entry;
             }
         }
         if let Some(slot) = response.sources_mut() {
-            *slot = output;
+            *slot = into_entries(matched);
         }
         response
     })

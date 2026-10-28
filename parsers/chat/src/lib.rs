@@ -41,6 +41,8 @@ pub mod nonempty_content;
 pub mod prefill;
 pub mod reasoning_off;
 pub mod reasoning_usage;
+#[cfg(test)]
+mod recording_allocation_tests;
 pub mod route;
 pub mod special_tokens;
 pub mod stop_tokens;

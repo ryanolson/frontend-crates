@@ -14,8 +14,8 @@ use std::collections::HashMap;
 
 use std::ops::Range;
 
-use dynamo_parsers::chat_stream::{ChatStreamItem, choice_texts};
-use dynamo_parsers::sources::{ChoiceSources, match_choice_sources};
+use dynamo_parsers::chat_stream::{ChatStreamItem, choice_text, into_entries, match_chunk_sources};
+use dynamo_parsers::sources::ChoiceSources;
 use dynamo_protocols::types::{ChatChoiceStream, ChatCompletionMessageContent};
 use dynamo_renderer::request_rules::ChatTemplateArgs;
 use futures::{Stream, StreamExt};
@@ -97,6 +97,17 @@ impl DeferredUnifiedChoice {
             _ => HeldSources::default(),
         }
     }
+}
+
+/// `front`'s ranges, then `back`'s. When one list is empty the other is the
+/// result, so text that only one side holds needs no new list: joining into an
+/// empty list allocated once per chunk.
+fn join_ranges(mut front: Vec<Range<usize>>, mut back: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    if front.is_empty() {
+        return back;
+    }
+    front.append(&mut back);
+    front
 }
 
 /// The source entry of a choice of one output chunk, or none when its text
@@ -198,14 +209,10 @@ fn defer_chunk<I: PolicyStreamItem>(
     // the output slot gets the ranges of the text this stage emits.
     let entries = response.sources_mut().map(std::mem::take);
     let recording = entries.is_some();
-    let texts = match &entries {
-        Some(_) => response
-            .chunk()
-            .map_or_else(Vec::new, |data| choice_texts(&data.choices)),
-        None => Vec::new(),
-    };
-    let mut matched = entries.map(|entries| match_choice_sources(entries, &texts));
-    let mut output_sources: Vec<ChoiceSources> = Vec::new();
+    let mut matched = entries.map(|entries| {
+        let choices = response.chunk().map_or(&[][..], |data| &data.choices[..]);
+        match_chunk_sources(entries, choices)
+    });
     let Some(data) = response.chunk_mut() else {
         return false;
     };
@@ -221,12 +228,10 @@ fn defer_chunk<I: PolicyStreamItem>(
         let given = matched
             .as_mut()
             .and_then(|matched| matched.get_mut(position)?.take());
-        if recording
-            && given.is_none()
-            && texts
-                .get(position)
-                .is_some_and(|text| text.content_len + text.reasoning_len > 0)
-        {
+        if recording && given.is_none() && {
+            let text = choice_text(choice);
+            text.content_len + text.reasoning_len > 0
+        } {
             state.unsourced = true;
         }
         let (mut content_sources, mut reasoning_sources) = given
@@ -260,10 +265,9 @@ fn defer_chunk<I: PolicyStreamItem>(
                     let mut content = std::mem::take(&mut state.pending_content);
                     content.push_str(&text);
                     choice.delta.content = Some(ChatCompletionMessageContent::Text(content));
-                    if recording {
-                        let mut held = std::mem::take(&mut state.held().content);
-                        held.append(&mut content_sources);
-                        content_sources = held;
+                    if let Some(held) = state.held.as_deref_mut() {
+                        let front = std::mem::take(&mut held.content);
+                        content_sources = join_ranges(front, content_sources);
                     }
                 }
             }
@@ -314,9 +318,8 @@ fn defer_chunk<I: PolicyStreamItem>(
                 match choice.delta.content.as_mut() {
                     Some(ChatCompletionMessageContent::Text(existing)) => {
                         existing.insert_str(0, &content);
-                        let mut front = std::mem::take(&mut held.content);
-                        front.append(&mut content_sources);
-                        content_sources = front;
+                        let front = std::mem::take(&mut held.content);
+                        content_sources = join_ranges(front, content_sources);
                     }
                     Some(ChatCompletionMessageContent::Parts(_)) | None => {
                         let mut prefix = choice.clone();
@@ -348,12 +351,14 @@ fn defer_chunk<I: PolicyStreamItem>(
                 match choice.delta.content.as_mut() {
                     Some(ChatCompletionMessageContent::Text(existing)) => {
                         existing.push_str(&content);
-                        content_sources.append(&mut held.content);
+                        let back = std::mem::take(&mut held.content);
+                        content_sources = join_ranges(content_sources, back);
                     }
                     Some(ChatCompletionMessageContent::Parts(_)) => {}
                     None => {
                         choice.delta.content = Some(ChatCompletionMessageContent::Text(content));
-                        content_sources.append(&mut held.content);
+                        let back = std::mem::take(&mut held.content);
+                        content_sources = join_ranges(content_sources, back);
                     }
                 }
             }
@@ -363,7 +368,8 @@ fn defer_chunk<I: PolicyStreamItem>(
                     .reasoning_content
                     .get_or_insert_default()
                     .push_str(&reasoning);
-                reasoning_sources.append(&mut held.reasoning);
+                let back = std::mem::take(&mut held.reasoning);
+                reasoning_sources = join_ranges(reasoning_sources, back);
             }
         }
 
@@ -379,22 +385,34 @@ fn defer_chunk<I: PolicyStreamItem>(
             ) {
                 content_sources.clear();
             }
-            output_sources.extend(entry(
-                recording,
-                state.unsourced,
-                choice.index,
-                content_sources,
-                reasoning_sources,
-            ));
+            // Back at its position, so the output list reuses the input's,
+            // in choice order.
+            if let Some(matched) = matched.as_mut() {
+                matched[position] = entry(
+                    recording,
+                    state.unsourced,
+                    choice.index,
+                    content_sources,
+                    reasoning_sources,
+                );
+            }
         }
     }
 
     let has_choices = !data.choices.is_empty();
     if recording && let Some(slot) = response.sources_mut() {
-        *slot = output_sources;
+        *slot = matched.map_or_else(Vec::new, into_entries);
     }
     if has_choices {
-        *last_response = Some(response.clone());
+        // The copy is only the envelope of an end-of-stream flush, which
+        // writes its own entries, so it leaves the slot behind: copying it
+        // cost recording two allocations per chunk.
+        let slot = response.sources_mut().map(std::mem::take);
+        let envelope = response.clone();
+        if let (Some(slot), Some(kept)) = (slot, response.sources_mut()) {
+            *kept = slot;
+        }
+        *last_response = Some(envelope);
     }
     true
 }
