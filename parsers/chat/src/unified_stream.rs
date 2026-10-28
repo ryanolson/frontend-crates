@@ -38,7 +38,7 @@ use crate::families::{
     QWEN3_TOOL_CALL_PARSER, QWEN3_UNIFIED_FAMILY,
 };
 use crate::guided::GuidedToolConstraint;
-use crate::spans::{FeedMap, Spans, append_spans, spans_len, split_spans};
+use crate::spans::{FeedMap, InlineList, Spans, append_spans, spans_len, split_spans};
 use crate::stream_item::{ToolCallCompletion, UnifiedStreamChunk, UnifiedStreamItem};
 
 #[cfg(test)]
@@ -996,9 +996,9 @@ fn coalesce(deltas: Vec<UnifiedParserEvent>) -> Vec<UnifiedParserEvent> {
 fn coalesce_deltas(deltas: Deltas) -> Deltas {
     let mut out = Deltas {
         events: Vec::with_capacity(deltas.events.len()),
-        spans: deltas.spans.as_ref().map(|_| Vec::new()),
+        spans: deltas.spans.as_ref().map(|_| InlineList::new()),
     };
-    let mut spans = deltas.spans.map(Vec::into_iter);
+    let mut spans = deltas.spans.map(IntoIterator::into_iter);
     for delta in deltas.events {
         let delta_spans = spans.as_mut().and_then(Iterator::next).unwrap_or_default();
         match (out.events.last_mut(), delta) {
@@ -1418,14 +1418,14 @@ fn test_parser_override(_family: &str, _tools: &[Tool]) -> Option<Box<dyn Unifie
 #[derive(Default)]
 struct Deltas {
     events: Vec<UnifiedParserEvent>,
-    spans: Option<Vec<Spans>>,
+    spans: Option<InlineList<Spans>>,
 }
 
 impl Deltas {
     fn new(recording: bool) -> Self {
         Self {
             events: Vec::new(),
-            spans: recording.then(Vec::new),
+            spans: recording.then(InlineList::new),
         }
     }
 
@@ -1470,7 +1470,7 @@ struct Recording {
     fed: FeedMap,
     scratch: Vec<Range<usize>>,
     /// Beside the events that `push` and `finish` returned, until `choices_for`.
-    event_spans: Vec<Spans>,
+    event_spans: InlineList<Spans>,
     /// Beside `pending_qwen_opener_text`.
     qwen_opener: Spans,
     /// Beside each entry of `pending_qwen_opener_reasoning`.
@@ -1635,10 +1635,10 @@ impl ChoiceState {
             Box::new(Recording {
                 fed: FeedMap::new(0),
                 scratch: Vec::new(),
-                event_spans: Vec::new(),
-                qwen_opener: Vec::new(),
+                event_spans: InlineList::new(),
+                qwen_opener: Spans::new(),
                 qwen_reasoning: Vec::new(),
-                upstream_reasoning: Vec::new(),
+                upstream_reasoning: Spans::new(),
                 choice_sources: Vec::new(),
                 error: None,
             })
@@ -1748,7 +1748,7 @@ impl ChoiceState {
                 _ => &[],
             };
             let mut need = text.len();
-            let mut spans = Vec::new();
+            let mut spans = Spans::new();
             while need > 0 {
                 let Some(range) = local.get_mut(cursor) else {
                     recording.fail(format!(
@@ -1791,7 +1791,7 @@ impl ChoiceState {
     /// Feed one decoded text delta through the parser.
     #[cfg(test)]
     pub(crate) fn push(&mut self, text: &str) -> Vec<UnifiedParserEvent> {
-        self.push_sourced(text, Vec::new())
+        self.push_sourced(text, Spans::new())
     }
 
     /// [`push`](Self::push), with the caller ranges that tile `text`.
@@ -1946,7 +1946,7 @@ impl ChoiceState {
         let mut ordered = Deltas::new(recording);
         let mut inserted = false;
         let taken = std::mem::take(events);
-        let mut spans = taken.spans.map(Vec::into_iter);
+        let mut spans = taken.spans.map(IntoIterator::into_iter);
         let mut pending = Some(pending);
         for event in taken.events {
             let mut event_spans = spans.as_mut().and_then(Iterator::next).unwrap_or_default();
@@ -2033,7 +2033,7 @@ impl ChoiceState {
                 );
                 // Output from the failed finish is dropped, so are its sources.
                 self.discard_parser_sources();
-                events.append(self.give_up_sourced("", Vec::new()));
+                events.append(self.give_up_sourced("", Spans::new()));
             }
         }
         self.append_pending_qwen_reasoning(&mut events);
@@ -2049,7 +2049,7 @@ impl ChoiceState {
     /// does instead, so that chunk is not lost either.
     #[cfg(test)]
     fn give_up(&mut self, fallback: &str) -> Vec<UnifiedParserEvent> {
-        self.give_up_sourced(fallback, Vec::new()).events
+        self.give_up_sourced(fallback, Spans::new()).events
     }
 
     /// [`give_up`](Self::give_up), with the ranges of `fallback`.
@@ -2060,7 +2060,7 @@ impl ChoiceState {
     fn give_up_sourced(&mut self, fallback: &str, fallback_spans: Spans) -> Deltas {
         self.failed = true;
         let mut recovered = self.parser.reset();
-        let mut spans = Vec::new();
+        let mut spans = Spans::new();
         if let Some(recording) = self.recording.as_deref_mut() {
             self.parser.take_sources(&mut recording.scratch);
             let mut done = 0;
@@ -2195,7 +2195,7 @@ impl ChoiceState {
                     std::mem::take(&mut recording.upstream_reasoning),
                 )
             }
-            None => (None, Vec::new()),
+            None => (None, Spans::new()),
         };
         // Queued reasoning belongs to its earlier source response. Coalescing it
         // with parser reasoning would erase the source envelope's event boundary.
@@ -2228,7 +2228,7 @@ impl ChoiceState {
             events: deltas,
             spans: projected_spans,
         } = projected;
-        let mut projected_spans = projected_spans.map(Vec::into_iter);
+        let mut projected_spans = projected_spans.map(IntoIterator::into_iter);
         let mut sources: Option<Vec<ChoiceSources>> = recording.then(Vec::new);
         let mut upstream_reasoning = Some(upstream_reasoning);
         let envelope_position = (0..deltas.len())
@@ -2274,8 +2274,10 @@ impl ChoiceState {
                 ..ChoiceSources::default()
             };
             match &delta {
-                UnifiedParserEvent::Text(_) => choice_sources.content = delta_spans,
-                UnifiedParserEvent::Reasoning(_) => choice_sources.reasoning = delta_spans,
+                UnifiedParserEvent::Text(_) => choice_sources.content = delta_spans.into_vec(),
+                UnifiedParserEvent::Reasoning(_) => {
+                    choice_sources.reasoning = delta_spans.into_vec()
+                }
                 _ => {}
             }
             let mut choice = self.delta_to_choice(index, delta);
@@ -2291,7 +2293,7 @@ impl ChoiceState {
                         .insert_str(0, reasoning);
                     let mut spans = upstream_reasoning.take().unwrap_or_default();
                     append_spans(&mut spans, std::mem::take(&mut choice_sources.reasoning));
-                    choice_sources.reasoning = spans;
+                    choice_sources.reasoning = spans.into_vec();
                 }
                 if let Some(mut original_calls) = original.delta.tool_calls.clone() {
                     if let Some(parsed_calls) = choice.delta.tool_calls.take() {
@@ -2326,7 +2328,8 @@ impl ChoiceState {
                 choice.delta.tool_calls = original.delta.tool_calls.clone();
                 choice.delta.function_call = original.delta.function_call.clone();
                 if choice.delta.reasoning_content.is_some() {
-                    choice_sources.reasoning = upstream_reasoning.take().unwrap_or_default();
+                    choice_sources.reasoning =
+                        upstream_reasoning.take().unwrap_or_default().into_vec();
                 }
             }
             choice.finish_reason = self.normalize_finish_reason(finish_reason);
@@ -2367,7 +2370,7 @@ impl ChoiceState {
                     index,
                     content: Vec::new(),
                     reasoning: if choice.delta.reasoning_content.is_some() {
-                        upstream_reasoning.take().unwrap_or_default()
+                        upstream_reasoning.take().unwrap_or_default().into_vec()
                     } else {
                         Vec::new()
                     },
@@ -2833,9 +2836,9 @@ fn probe_choice_sources(choice: &ChatChoiceStream, spans: Spans) -> ChoiceSource
         ..ChoiceSources::default()
     };
     if choice.delta.content.is_some() {
-        sources.content = spans;
+        sources.content = spans.into_vec();
     } else {
-        sources.reasoning = spans;
+        sources.reasoning = spans.into_vec();
     }
     sources
 }
@@ -2863,7 +2866,7 @@ fn take_qwen_reasoning_response<I: UnifiedStreamItem>(
         *slot = vec![ChoiceSources {
             index: source_reasoning.index,
             content: Vec::new(),
-            reasoning: pending.spans,
+            reasoning: pending.spans.into_vec(),
         }];
     }
     data.inner_mut().choices = vec![source_reasoning];
@@ -3588,7 +3591,7 @@ where
                             states
                                 .get_mut(&original.index)
                                 .expect("preserved parser state must still exist")
-                                .queue_qwen_opener_reasoning_sourced(reasoning.clone(), reasoning_spans.clone());
+                                .queue_qwen_opener_reasoning_sourced(reasoning.clone(), Spans::from(reasoning_spans.clone()));
                             let mut source_data = chat.clone();
                             source_data.inner_mut().choices.clear();
                             let keep_source_metadata = !qwen_source_metadata_deferred;
@@ -3602,7 +3605,7 @@ where
                             record.pending_qwen_opener_responses.push_back(
                                 PendingQwenReasoningResponse {
                                     text: reasoning,
-                                    spans: reasoning_spans,
+                                    spans: Spans::from(reasoning_spans),
                                     choice: original.clone(),
                                     data: source_data,
                                     annotation: if keep_source_metadata {
@@ -3825,7 +3828,7 @@ where
                         detected_prefill = UnifiedParserStartingState::Response;
                     }
                     original.delta.content = Some(ChatCompletionMessageContent::Text(probe.text));
-                    input.content = probe_spans;
+                    input.content = probe_spans.into_vec();
                 }
 
                 let state = match states.entry(original.index) {
@@ -3967,7 +3970,7 @@ where
                 if let Some(ChatCompletionMessageContent::Text(text)) =
                     original.delta.content.as_ref()
                 {
-                    deltas.extend(state.push_sourced(text, std::mem::take(&mut input.content)));
+                    deltas.extend(state.push_sourced(text, Spans::from(std::mem::take(&mut input.content))));
                 }
                 let terminal = original.finish_reason;
                 let already_finished = records
@@ -3980,7 +3983,7 @@ where
                     records.entry(original.index).or_default().finished = true;
                 }
 
-                state.set_upstream_reasoning(std::mem::take(&mut input.reasoning));
+                state.set_upstream_reasoning(Spans::from(std::mem::take(&mut input.reasoning)));
                 let mut choices = state.choices_for(&original, deltas, true, terminal);
                 let choice_sources = state.take_choice_sources();
                 if let Some(error) = state.take_recording_error() {

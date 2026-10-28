@@ -1046,32 +1046,6 @@ fn usage_flush_checks_sources_before_emitting_held_text() {
     }
 }
 
-thread_local! {
-    static REVIEW_SOURCE_ALLOCATIONS: std::cell::Cell<Option<(usize, usize)>> =
-        const { std::cell::Cell::new(None) };
-}
-
-struct SourceReviewAllocator;
-
-unsafe impl std::alloc::GlobalAlloc for SourceReviewAllocator {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let pointer = unsafe { std::alloc::System.alloc(layout) };
-        let _ = REVIEW_SOURCE_ALLOCATIONS.try_with(|count| {
-            if let Some((allocations, bytes)) = count.get() {
-                count.set(Some((allocations + 1, bytes + layout.size())));
-            }
-        });
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
-        unsafe { std::alloc::System.dealloc(pointer, layout) };
-    }
-}
-
-#[global_allocator]
-static SOURCE_REVIEW_ALLOCATOR: SourceReviewAllocator = SourceReviewAllocator;
-
 #[test]
 fn stock_qwen_restoration_allocates_only_the_choice_and_envelope() {
     let mut item = text_chunk(0, None, Some("queued"), false);
@@ -1082,15 +1056,16 @@ fn stock_qwen_restoration_allocates_only_the_choice_and_envelope() {
         .pending_qwen_opener_responses
         .push_back(PendingQwenReasoningResponse {
             text: "queued".to_string(),
-            spans: Vec::new(),
+            spans: Spans::new(),
             choice,
             data,
             annotation: (None, None, None, None),
         });
 
-    REVIEW_SOURCE_ALLOCATIONS.with(|count| count.set(Some((0, 0))));
+    use crate::test_allocations::{allocations, bytes};
+    let before = (allocations(), bytes());
     let restored = take_qwen_reasoning_response(&mut record);
-    let observed = REVIEW_SOURCE_ALLOCATIONS.with(|count| count.replace(None).unwrap());
+    let observed = (allocations() - before.0, bytes() - before.1);
     let expected_bytes = std::mem::size_of::<ChatChoiceStream>()
         + std::mem::size_of::<(NvCreateChatCompletionStreamResponse, AnnotationParts)>();
     assert_eq!(
@@ -1479,5 +1454,41 @@ fn the_checker_rejects_a_range_from_the_wrong_place() {
     assert!(
         check_sources(&output, &texts).is_err(),
         "accepted stripped opener 1..6 instead of reasoning 7..12"
+    );
+}
+
+/// Extra allocations per chunk that recording may cost in the adapter, with
+/// the recording test parser: its own range list, and the entry list and
+/// range lists that each output chunk carries. It was 11.2.
+const ADAPTER_EXTRA_PER_CHUNK: f64 = 8.0;
+
+/// Recording through the adapter costs few allocations per chunk. Each event's
+/// range list was a vector, the per-push event lists of ranges were vectors,
+/// and the ranges kept for the choices were taken out on every chunk, so
+/// recording allocated about four times per chunk in the adapter alone.
+#[test]
+fn recording_through_the_adapter_allocates_little_per_chunk() {
+    use crate::test_allocations::allocations;
+    let _parser = ParserOverride::install(false);
+    let request = Request::native("glm47");
+    let reply = "<think>The user asks about the weather, so I check it.</think>Let me check the weather for you, then answer.";
+    let plain = split(reply, 1);
+    let chunks = plain.len();
+    request.run(plain.clone());
+    let input = plain.clone();
+    let before = allocations();
+    std::hint::black_box(request.run(input));
+    let off = allocations() - before;
+    let (input, _) = with_slots(&plain);
+    request.run(input);
+    let (input, _) = with_slots(&plain);
+    let before = allocations();
+    std::hint::black_box(request.run(input));
+    let on = allocations() - before;
+    let extra = (on as f64 - off as f64) / chunks as f64;
+    println!("adapter: off {off}, on {on}, {extra:.3} extra per chunk over {chunks} chunks");
+    assert!(
+        extra <= ADAPTER_EXTRA_PER_CHUNK,
+        "recording costs {extra:.3} allocations per chunk, budget {ADAPTER_EXTRA_PER_CHUNK}"
     );
 }

@@ -5051,7 +5051,7 @@ async fn qwen_queued_reasoning_preserves_choice_envelope_on_resolution_and_eof()
                             Annotated<NvCreateChatCompletionStreamResponse>,
                         > {
                             text: "detour".into(),
-                            spans: Vec::new(),
+                            spans: Spans::new(),
                             choice: expected.clone(),
                             data: source.data.clone().unwrap(),
                             annotation: (
