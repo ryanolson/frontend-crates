@@ -59,8 +59,8 @@ pub use self::boundary::{
     JailChoiceCountError, apply_jail_terminal_error_contract, validate_jail_nvext_choice_count,
 };
 use self::prefix_matcher::{MarkerMatcher, MatchResult};
-use crate::chat_stream::{SourcedChunk, choice_texts};
-use crate::sources::{ChoiceSources, SourcedText, Spans, match_choice_sources};
+use crate::chat_stream::{SourcedChunk, match_chunk_sources};
+use crate::sources::{ChoiceSources, SourcedText, Spans};
 use crate::tool_calling::parsers::{
     detect_and_parse_tool_call_sourced, detect_and_parse_tool_call_with_recovery_sourced,
 };
@@ -2314,10 +2314,10 @@ impl JailedStream {
             // Process each item in the stream
             while let Some(item) = stream.next().await {
                 let (response, input_sources) = item.into_parts();
-                // Each choice's entry, paired by `match_choice_sources`.
+                // Each choice's entry, paired by `match_chunk_sources`.
                 let matched: Vec<Option<ChoiceSources>> = match (input_sources, response.data.as_ref()) {
                     (Some(entries), Some(data)) if recording => {
-                        match_choice_sources(entries, &choice_texts(&data.choices))
+                        match_chunk_sources(entries, &data.choices)
                     }
                     _ => Vec::new(),
                 };
