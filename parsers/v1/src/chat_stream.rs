@@ -97,6 +97,15 @@ fn choice_text(choice: &ChatChoiceStream) -> ChoiceText {
     }
 }
 
+/// The entries of `matched` that are set, in order, in `matched`'s own
+/// vector: a stage that writes each choice's output entry back at its
+/// position gets its output list without a new allocation.
+// `filter_map` collects in place; `flatten`, which clippy suggests, does not.
+#[allow(clippy::filter_map_identity)]
+pub fn into_entries(matched: Vec<Option<ChoiceSources>>) -> Vec<ChoiceSources> {
+    matched.into_iter().filter_map(|entry| entry).collect()
+}
+
 /// [`match_choice_sources`] over a chunk's choices.
 ///
 /// When each entry names the choice at its own position, as a caller that
