@@ -403,3 +403,7 @@ where
 #[cfg(test)]
 #[path = "stream_policies_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "sources_end_to_end_tests.rs"]
+mod sources_end_to_end_tests;
