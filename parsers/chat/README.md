@@ -16,6 +16,9 @@ The rules an OpenAI chat frontend uses to pick and drive Dynamo's parsers. The p
 | `special_tokens` | The `skip_special_tokens` default for each parser. |
 | `stop_tokens` | A tool-call end token that is a hidden EOS becomes a visible stop. |
 | `tools` | The effective tools (top-level and system-message tools) and the tool-parsing gate. |
+| `unified_stream` | The v2 stream adapter: one unified parser per choice turns raw model text into reasoning, content, and tool-call chunks, then fixes each choice's finish reason. |
+| `stream_item` | The stream item that `unified_stream` reads. Dynamo implements it for its own item, so its per-chunk fields (`nvext`, metrics, completion evidence) stay in place. A chunk with a `SourceSlot` (from `dynamo-parsers`) also gets, for each choice, the input byte ranges its text came from. |
+| `guided` | `GuidedToolConstraint`: the tool-output grammar a request installed. |
 
 ```rust
 use dynamo_chat_parsing::{ParserVersion, ToolProcessingRoute, tool_processing_route};
@@ -32,3 +35,5 @@ cargo test -p dynamo-chat-parsing
 ```
 
 `tests/dynamo_llm_parity.rs` replays the output of dynamo-llm's own code, recorded by `tests/data/recorder.rs`, and checks that this crate gives the same answer on the same input. `tests/moved_from_dynamo_llm.rs` holds dynamo-llm's tests of these rules.
+
+`tests/unified_stream_parity.rs` does the same for the v2 stream adapter, with output recorded by `tests/data/unified_stream_recorder.rs`. dynamo-llm's unit tests for the adapter are in `src/unified_stream_tests.rs`.
