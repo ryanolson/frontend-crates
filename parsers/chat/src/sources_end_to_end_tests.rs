@@ -460,3 +460,76 @@ async fn a_complete_gemma_header_is_not_a_design_refusal() {
         "the complete header records successfully and holds no prompt label bytes"
     );
 }
+
+#[tokio::test]
+#[ignore = "F5: the order rule rejects exact ranges after upstream reasoning precedes a held byte"]
+async fn f5_policy_source_checker_accepts_reordered_exact_ranges() {
+    let mut case = corpus()
+        .into_iter()
+        .find(|case| case["name"] == "core/qwen3/reason_text/split4/none")
+        .unwrap();
+    let mut failures = Vec::new();
+    for choices in [1, 2] {
+        for terminal in [false, true] {
+            for usage_flush in [false, true] {
+                let first: Vec<_> = (0..choices)
+                    .map(|index| {
+                        json!({
+                            "index": index, "delta": {"content": "<think><"}
+                        })
+                    })
+                    .collect();
+                let last: Vec<_> = (0..choices)
+                    .map(|index| {
+                        let mut choice = json!({"index": index,
+                        "delta": {"reasoning_content": "B", "content": "C</think>D"}});
+                        if terminal {
+                            choice["finish_reason"] = json!("stop");
+                        }
+                        choice
+                    })
+                    .collect();
+                let mut chunks = vec![
+                    json!({"data": {"choices": first}}),
+                    json!({"data": {"choices": last}}),
+                ];
+                if usage_flush {
+                    chunks.push(json!({"data": {"choices": [], "usage": {
+                        "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2
+                    }}}));
+                }
+                case["input"] = json!(chunks);
+                let (_, texts) = input(&case, true);
+                for fold in [false, true] {
+                    for defer in [false, true] {
+                        let stock = run(&case, false, fold, defer).await;
+                        let recorded = run(&case, true, fold, defer).await;
+                        assert_eq!(id_shape(&recorded), id_shape(&stock));
+                        assert!(recorded.iter().all(|item| item.chunk.error.is_none()));
+                        for index in 0..choices {
+                            assert_eq!(&texts[&index], "<think><BC</think>D");
+                            let ranges: Vec<_> = recorded
+                                .iter()
+                                .flat_map(|item| item.sources.iter().flatten())
+                                .filter(|entry| entry.index == index)
+                                .flat_map(|entry| {
+                                    entry.content.iter().chain(&entry.reasoning).cloned()
+                                })
+                                .collect();
+                            assert_eq!(ranges, vec![8..9, 7..8, 9..10, 18..19]);
+                            assert_eq!(read(&texts[&index], &ranges).as_deref(), Some("B<CD"));
+                        }
+                        if let Err(error) = check(&recorded, &texts) {
+                            failures.push(format!("n={choices} terminal={terminal} usage={usage_flush} fold={fold} defer={defer}: {error}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "exact ranges rejected in {} runs: {failures:#?}",
+        failures.len()
+    );
+}
