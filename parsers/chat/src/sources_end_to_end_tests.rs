@@ -533,3 +533,24 @@ async fn f5_policy_source_checker_accepts_reordered_exact_ranges() {
         failures.len()
     );
 }
+
+#[tokio::test]
+#[ignore = "F6: the order rule accepts the first reasoning run inside a stripped opener"]
+async fn f6_policy_source_checker_rejects_a_first_run_inside_the_opener() {
+    let mut case = corpus()
+        .into_iter()
+        .find(|case| case["name"] == "core/qwen3/reason_text/split4/none")
+        .unwrap();
+    case["input"] = json!([{"data": {"choices": [{"index": 0,
+        "delta": {"content": "<think>think</think>"}, "finish_reason": "stop"}]}}]);
+    let (_, texts) = input(&case, true);
+    let mut output = run(&case, true, false, false).await;
+    check(&output, &texts).unwrap();
+    assert_eq!(&texts[&0][1..6], "think");
+    assert_eq!(&texts[&0][7..12], "think");
+    move_reasoning_source(&mut output, 7..12, 1..6);
+    assert!(
+        check(&output, &texts).is_err(),
+        "accepted stripped opener 1..6 instead of reasoning 7..12"
+    );
+}
