@@ -411,3 +411,30 @@ async fn text_without_ranges_gets_no_entry() {
         assert!(item.sources().unwrap().is_empty());
     }
 }
+
+#[tokio::test]
+#[ignore = "F1: the fold rewrites the first source entry twice for duplicate choice indices"]
+async fn review_f1_fold_dates_each_duplicate_choice_entry() {
+    let chunks = vec![chunk(vec![
+        json!({"index": 0, "delta": {"reasoning_content": "R", "content": "A"}}),
+        json!({"index": 0, "delta": {"reasoning_content": "S", "content": "B"}}),
+    ])];
+    let output: Vec<SourcedChunk> = fold(stream::iter(with_sources(&chunks)).boxed())
+        .collect()
+        .await;
+    let item = &output[0];
+    let choices = &item.chunk().unwrap().choices;
+    let entries = item.sources().unwrap();
+    assert_eq!(choices.len(), 2);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(text_of(&choices[0].delta.content), "RA");
+    assert_eq!(text_of(&choices[1].delta.content), "SB");
+    for (choice, entry) in choices.iter().zip(entries) {
+        assert_eq!(
+            read("RASB", &entry.content),
+            text_of(&choice.delta.content),
+            "each duplicate choice must use its own source entry"
+        );
+        assert!(entry.reasoning.is_empty());
+    }
+}
