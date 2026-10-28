@@ -51,6 +51,8 @@ pub mod stream_item;
 mod stream_policies_cost_tests;
 #[cfg(test)]
 mod stream_policies_sources_tests;
+#[cfg(test)]
+mod test_allocations;
 pub mod tool_call_policy;
 pub mod tools;
 pub mod unified_stream;

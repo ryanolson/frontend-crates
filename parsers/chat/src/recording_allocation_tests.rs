@@ -13,9 +13,6 @@
 // The caller's entry for one chunk is one range.
 #![allow(clippy::single_range_in_vec_init)]
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
-
 use dynamo_parsers::chat_stream::SourcedChunk;
 use dynamo_parsers::sources::ChoiceSources;
 use dynamo_parsers::tool_calling::jail::Annotated;
@@ -24,41 +21,7 @@ use futures::{StreamExt, stream};
 
 use crate::nonempty_content::defer_unified_reasoning_for_nonempty_content;
 use crate::reasoning_off::fold_reasoning_into_content;
-
-thread_local! {
-    // Per thread, so the other tests in this binary do not count.
-    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
-}
-
-fn count() {
-    let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
-}
-
-fn allocations() -> usize {
-    ALLOCATIONS.with(Cell::get)
-}
-
-struct Counting;
-
-// SAFETY: every call forwards to `System` with the same arguments.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count();
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        count();
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
+use crate::test_allocations::allocations;
 
 /// Extra allocations per chunk that recording may cost in each stage.
 const EXTRA_PER_CHUNK: f64 = 0.05;
