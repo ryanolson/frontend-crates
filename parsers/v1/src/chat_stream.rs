@@ -26,7 +26,7 @@ use dynamo_protocols::types::{
     ChatChoiceStream, ChatCompletionMessageContent, CreateChatCompletionStreamResponse,
 };
 
-use crate::sources::{ChoiceSources, ChoiceText, SourceSlot};
+use crate::sources::{ChoiceSources, ChoiceText, SourceSlot, entry_covers, match_choice_sources};
 use crate::tool_calling::jail::Annotated;
 
 /// A stream item that may carry one OpenAI chat completion chunk.
@@ -79,20 +79,59 @@ impl ChatStreamItem for Annotated<CreateChatCompletionStreamResponse> {
 ///
 /// [`match_choice_sources`]: crate::sources::match_choice_sources
 pub fn choice_texts(choices: &[ChatChoiceStream]) -> Vec<ChoiceText> {
-    choices
-        .iter()
-        .map(|choice| ChoiceText {
-            index: choice.index,
-            content_len: match &choice.delta.content {
-                Some(ChatCompletionMessageContent::Text(text)) => text.len(),
-                _ => 0,
-            },
-            reasoning_len: choice
-                .delta
-                .reasoning_content
-                .as_ref()
-                .map_or(0, String::len),
-        })
+    choices.iter().map(choice_text).collect()
+}
+
+/// The text lengths of one choice; see [`choice_texts`].
+pub fn choice_text(choice: &ChatChoiceStream) -> ChoiceText {
+    ChoiceText {
+        index: choice.index,
+        content_len: match &choice.delta.content {
+            Some(ChatCompletionMessageContent::Text(text)) => text.len(),
+            _ => 0,
+        },
+        reasoning_len: choice
+            .delta
+            .reasoning_content
+            .as_ref()
+            .map_or(0, String::len),
+    }
+}
+
+/// The entries of `matched` that are set, in order, in `matched`'s own
+/// vector: a stage that writes each choice's output entry back at its
+/// position gets its output list without a new allocation.
+// `filter_map` collects in place; `flatten`, which clippy suggests, does not.
+#[allow(clippy::filter_map_identity)]
+pub fn into_entries(matched: Vec<Option<ChoiceSources>>) -> Vec<ChoiceSources> {
+    matched.into_iter().filter_map(|entry| entry).collect()
+}
+
+/// [`match_choice_sources`] over a chunk's choices.
+///
+/// When each entry names the choice at its own position, as a caller that
+/// writes one entry per choice does, the rule pairs them position by
+/// position. That case reuses the entries' vector and allocates nothing: the
+/// general rule allocated about five times per chunk, in every stage that
+/// records. Any other shape goes through the general rule.
+///
+/// [`match_choice_sources`]: crate::sources::match_choice_sources
+pub fn match_chunk_sources(
+    entries: Vec<ChoiceSources>,
+    choices: &[ChatChoiceStream],
+) -> Vec<Option<ChoiceSources>> {
+    let positional = entries.len() == choices.len()
+        && entries
+            .iter()
+            .zip(choices)
+            .all(|(entry, choice)| entry.index == choice.index);
+    if !positional {
+        return match_choice_sources(entries, &choice_texts(choices));
+    }
+    entries
+        .into_iter()
+        .zip(choices)
+        .map(|(entry, choice)| entry_covers(&entry, &choice_text(choice)).then_some(entry))
         .collect()
 }
 
@@ -140,5 +179,84 @@ impl ChatStreamItem for SourcedChunk {
 
     fn scrub_synthetic(&mut self) {
         self.chunk.scrub_synthetic();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dynamo_protocols::types::ChatCompletionStreamResponseDelta;
+
+    fn choice(index: u32, content: usize, reasoning: usize) -> ChatChoiceStream {
+        let text = |n: usize| "x".repeat(n);
+        #[allow(deprecated)]
+        ChatChoiceStream {
+            index,
+            delta: ChatCompletionStreamResponseDelta {
+                content: (content > 0).then(|| ChatCompletionMessageContent::Text(text(content))),
+                function_call: None,
+                tool_calls: None,
+                role: None,
+                refusal: None,
+                reasoning_content: (reasoning > 0).then(|| text(reasoning)),
+            },
+            finish_reason: None,
+            logprobs: None,
+        }
+    }
+
+    // A one-range list is what an entry holds here.
+    #[allow(clippy::single_range_in_vec_init)]
+    fn entry(index: u32, content: usize, reasoning: usize) -> ChoiceSources {
+        let ranges = |n: usize| if n == 0 { Vec::new() } else { vec![0..n] };
+        ChoiceSources {
+            index,
+            content: ranges(content),
+            reasoning: ranges(reasoning),
+        }
+    }
+
+    /// Every shape of up to three choices and three entries, over two
+    /// indices and lengths 0 to 1 (2 for an entry, which cannot match): the
+    /// chunk-level match gives what the general rule gives.
+    #[test]
+    fn the_chunk_match_is_the_general_rule() {
+        let choice_shapes: Vec<(u32, usize, usize)> = (0..2)
+            .flat_map(|i| (0..2).flat_map(move |c| (0..2).map(move |r| (i, c, r))))
+            .collect();
+        let entry_shapes: Vec<(u32, usize, usize)> = (0..2)
+            .flat_map(|i| (0..3).flat_map(move |c| (0..2).map(move |r| (i, c, r))))
+            .collect();
+        fn lists<T: Copy>(shapes: &[T], max: usize) -> Vec<Vec<T>> {
+            let mut out = vec![Vec::new()];
+            let mut level = vec![Vec::new()];
+            for _ in 0..max {
+                level = level
+                    .iter()
+                    .flat_map(|list: &Vec<T>| {
+                        shapes.iter().map(move |shape| {
+                            let mut next = list.clone();
+                            next.push(*shape);
+                            next
+                        })
+                    })
+                    .collect();
+                out.extend(level.iter().cloned());
+            }
+            out
+        }
+        let mut checked = 0;
+        for choices in lists(&choice_shapes, 3) {
+            let choices: Vec<ChatChoiceStream> =
+                choices.iter().map(|&(i, c, r)| choice(i, c, r)).collect();
+            for entries in lists(&entry_shapes, 3) {
+                let entries: Vec<ChoiceSources> =
+                    entries.iter().map(|&(i, c, r)| entry(i, c, r)).collect();
+                let general = match_choice_sources(entries.clone(), &choice_texts(&choices));
+                assert_eq!(match_chunk_sources(entries, &choices), general);
+                checked += 1;
+            }
+        }
+        assert!(checked > 100_000, "{checked} shapes");
     }
 }

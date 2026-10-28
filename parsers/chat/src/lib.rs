@@ -45,6 +45,8 @@ pub mod nonempty_content;
 pub mod prefill;
 pub mod reasoning_off;
 pub mod reasoning_usage;
+#[cfg(test)]
+mod recording_allocation_tests;
 pub mod route;
 mod spans;
 pub mod special_tokens;
@@ -54,6 +56,8 @@ pub mod stream_item;
 mod stream_policies_cost_tests;
 #[cfg(test)]
 mod stream_policies_sources_tests;
+#[cfg(test)]
+mod test_allocations;
 pub mod tool_call_policy;
 pub mod tools;
 pub mod unified_stream;
