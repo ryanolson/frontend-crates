@@ -111,10 +111,11 @@ fn recording_in_the_reasoning_parser_allocates_little_per_chunk() {
 
 /// Extra allocations per chunk that recording may cost on the v1 route: the
 /// reasoning stream, then the tool-call jail. Pairing a chunk's entries with
-/// its choices allocated about five times per stage and chunk; now each
-/// stage pays only for the entry list and range lists of its output chunks,
-/// which the public slot type asks for. It was 16 to 22 per chunk.
-const ROUTE_EXTRA_PER_CHUNK: f64 = 4.0;
+/// its choices allocated about five times per stage and chunk, and each
+/// output entry built new lists. The reasoning stream now reuses the input
+/// entry's lists; what remains is the jail's output entries, which the public
+/// slot type asks for. It was 16 to 22 per chunk.
+const ROUTE_EXTRA_PER_CHUNK: f64 = 2.0;
 
 #[test]
 fn recording_on_the_v1_route_allocates_little_per_chunk() {
