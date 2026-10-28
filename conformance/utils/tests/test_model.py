@@ -35,6 +35,7 @@ from fixture_snapshot import fixture_snapshot_root  # noqa: E402
 from fixtures import _version_sort_key  # noqa: E402
 from case_variants import leaf_cells
 from schema_cases import ARGUMENT_SECTIONS, schema_fold
+from null_cases import NULL_VARIANTS
 import unified_taxonomy
 from validate_conformance_status import cell_state
 from capture_stimulus import batch_final_events, capture_input  # noqa: E402
@@ -359,6 +360,21 @@ def test_case_schema_metadata_survives_model_serialization():
     raw = model_mod.to_script_json(model_mod.build_page({}, [tab]))
     decoded = json.loads(raw)
     assert decoded["tabs"][0]["columns"][0]["schemas"] == schemas
+
+
+def test_generic_unified_columns_span_multiple_families(model_v2):
+    tab = _tab(model_v2, "tab-unified")
+    for column in tab["columns"]:
+        if not re.match(r"unified_g\d+(?:_|$)", column["group_key"]):
+            continue
+        families = {
+            row["family"] for row in tab["rows"]
+            if row.get("family")
+            and (cell := row["cells"].get(column["sub"]))
+            and cell.get("status") != "na"
+            and cell.get("kind") in {"cell", "missing"}
+        }
+        assert len(families) > 1, (column["sub"], "single-family generic column", families)
 
 
 def test_rendered_model_carries_only_explicit_unified_case_schemas(model_v2):
@@ -1732,6 +1748,22 @@ def test_case_description_readers_accept_numbered_suffixes(tmp_path, monkeypatch
 
 def test_unified_null_column_popups_show_type_descriptions_above_chart(model_v2):
     tab = _tab(model_v2, "tab-unified")
+    subs = {"arg_json_null", "arg_string_null"}
+    columns = [column for column in tab["columns"] if column["sub"] in subs]
+    row = next(
+        row for row in tab["rows"]
+        if row.get("family") in table.gen_unified_golden.FAMILIES
+        and all(sub in row.get("cells", {}) for sub in subs)
+    )
+    tab = {
+        "case_prefix": tab.get("case_prefix", ""),
+        "columns": columns,
+        "rows": [{
+            "family": row["family"],
+            "model_label": row.get("model_label"),
+            "cells": {sub: row["cells"][sub] for sub in subs},
+        }],
+    }
     script = r"""
 const fs = require('fs');
 const vm = require('vm');
@@ -1777,16 +1809,18 @@ def test_unified_null_groups_keep_every_schema_variant_and_mixed_probe(model_v2)
     for row in tab["rows"]:
         if row.get("family") not in families:
             continue
-        mixed = True
-        refs = row["family"] in {"glm47", "qwen3", "nemotron_v3"}
         groups = []
-        for scenario, count in (("arg_json_null", 5), ("arg_string_null", 7)):
-            sub = next(col["sub"] for col in tab["columns"] if col["sub"] == scenario)
+        for scenario in ("arg_json_null", "arg_string_null"):
+            label = "7-" + scenario
+            sub = next(col["sub"] for col in tab["columns"] if col["label"] == label)
             cell = row["cells"][sub]
-            assert len(cell["variants"]) == count + int(mixed) + int(refs)
+            expected = {name for name, *_ in NULL_VARIANTS if name.startswith(scenario)}
+            expected.update({scenario + "_ref", "arg_null_mixed_labels"})
+            assert {leaf["sub"] for leaf in cell["variants"]} == expected
+            assert len(cell["variants"]) == len(expected)
             assert all("golden" in leaf["cmp"] for leaf in cell["variants"])
             groups.append({leaf["sub"] for leaf in cell["variants"]})
-        assert len(groups[0] & groups[1]) == int(mixed)
+        assert groups[0] & groups[1] == {"arg_null_mixed_labels"}
 
 
 def test_unified_deepseek_only_case_keeps_id_in_family_section(model_v2):
@@ -1985,7 +2019,8 @@ def test_shared_variants_consolidate_without_losing_requests(model_v2):
         expected = {s for s in unified_taxonomy.UNIFIED_TAX
                     if row["family"] in table.gen_unified_golden.scenario_families(s)}
         assert actual == expected
-        for variant, (parent, _) in unified_taxonomy.SHARED_CASE_VARIANTS.items():
+        for variant, metadata in unified_taxonomy.SHARED_CASE_VARIANTS.items():
+            parent = metadata.parent
             if variant in expected:
                 cell = row["cells"][parent]
                 assert cell["status"] != "na"
@@ -2137,12 +2172,11 @@ def test_null_groups_keep_every_schema_variant_and_mixed_probe(model_v2: dict) -
         if row.get("family") not in families:
             continue
         mixed = True
-        refs = tab_id == "tab-unified" and row["family"] in {"glm47", "qwen3", "nemotron_v3"}
         groups = []
-        for scenario, count in (("arg_json_null", 5), ("arg_string_null", 7)):
+        for scenario, count in (("arg_json_null", 6), ("arg_string_null", 8)):
             sub = next(col["sub"] for col in tab["columns"] if col["sub"] == scenario)
             cell = row["cells"][sub]
-            assert len(cell["variants"]) == count + int(mixed) + int(refs)
+            assert len(cell["variants"]) == count + int(mixed)
             assert all("golden" in leaf["cmp"] for leaf in cell["variants"])
             groups.append({leaf["sub"] for leaf in cell["variants"]})
             if tab_id.endswith("streamv1"):

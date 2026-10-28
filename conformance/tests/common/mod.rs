@@ -13,6 +13,7 @@
 
 pub mod known_toolcalling_chunking;
 pub mod known_unified_divergences;
+pub mod source_ranges;
 pub mod unified_capture;
 
 use std::collections::BTreeMap;
@@ -463,7 +464,7 @@ pub fn fixture_name(path: &Path) -> String {
 }
 
 /// Fold prior family captures through the current parser release checkpoint.
-pub const STREAM_DYNAMO_V2_CURRENT_CAPTURE: &str = "dynamo_v2-0.8.0";
+pub const STREAM_DYNAMO_V2_CURRENT_CAPTURE: &str = "dynamo_v2-0.8.1";
 
 // Batch-on-stream retains its own snapshot when the streaming capture advances.
 pub const BATCH_ON_STREAM_DYNAMO_V2_CAPTURE: &str = "dynamo_v2-0.7.24";

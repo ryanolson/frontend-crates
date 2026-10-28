@@ -1148,6 +1148,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1229,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "dynamo-parsers-v2"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "dynamo-structural-tag",

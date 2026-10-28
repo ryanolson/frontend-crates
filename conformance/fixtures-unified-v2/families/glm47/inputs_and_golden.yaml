@@ -6842,7 +6842,7 @@ cases:
   arg_json_null_ref:
     lifecycle: active
     scenario: arg_json_null_ref
-    description: 'The request tool schema permits JSON null. Bare parameter text `null` must produce JSON `null`; grammars with explicit types use native null syntax. Variants cover nullable type arrays, anyOf, oneOf, nullable, and const. Mixed-field probes also assert that non-nullable fields remain strings. Refs #251, #268, #269. `city` uses a local $ref to the tool parameters root; resolving its nullable definition must turn bare null text into JSON null.'
+    description: 'The request tool schema permits JSON null. Bare parameter text `null` must produce JSON `null`; grammars with explicit types use native null syntax. Variants cover nullable type arrays, anyOf, oneOf, nullable, and const. Mixed-field probes also assert that non-nullable fields remain strings. Refs #251, #268, #269. `city` uses a local $ref to the tool parameters root; resolving its nullable definition turns bare null text into JSON null.'
     policy:
     - I7
     display_id: UNIFIED.7-arg_json_null_ref
@@ -15319,3 +15319,43 @@ cases:
         arguments:
           value:
             s: </atem:parameter>
+  gpt_oss_multiple_unknown_and_empty_tools:
+    lifecycle: active
+    scenario: gpt_oss_multiple_unknown_and_empty_tools
+    description: Multiple tool messages preserve order, empty arguments become an empty object, and the parser emits a tool name even when it is not in the offered schema.
+    policy:
+    - I6
+    - I7
+    display_id: UNIFIED.gpt_oss-multiple_unknown_and_empty_tools
+    historical_ids: []
+    request:
+      input: <tool_call>run</tool_call><tool_call>not_offered<arg_key>x</arg_key><arg_value>2</arg_value></tool_call>
+      init:
+        starting_state: None
+        tool_output_mode: Native
+        named_tool: null
+      finish_reason: stop
+      tools: []
+      chunks:
+      - delta_text: <tool_call>
+      - delta_text: run
+      - delta_text: </tool_call>
+      - delta_text: <tool_call>
+      - delta_text: not_offered
+      - delta_text: <arg_key>
+      - delta_text: x
+      - delta_text: </arg_key>
+      - delta_text: <arg_value>
+      - delta_text: '2'
+      - delta_text: </arg_value>
+      - delta_text: </tool_call>
+      - delta_text: ‹finish›
+    golden:
+      assembled:
+      - kind: tool_call
+        name: run
+        arguments: {}
+      - kind: tool_call
+        name: not_offered
+        arguments:
+          x: '2'
