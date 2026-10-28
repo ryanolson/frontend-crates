@@ -6,7 +6,10 @@
 //! These rules decide what a request's prompt looks like beyond the template
 //! itself: which thinking mode the template sees, whether the last message
 //! stays open, whether the request's raw prompt replaces the template, and how
-//! historical tool-call arguments reach the template. They live here so that
+//! historical tool-call arguments reach the template. Two of them run in the
+//! frontend's HTTP handlers, before the others: the reasoning controls of Chat
+//! Completions and Responses, and the thinking default of Messages
+//! ([`apply_handler_rules`]). They live here so that
 //! any frontend that renders with this crate gives a client the same prompt
 //! as the Dynamo frontend.
 //!
@@ -15,6 +18,7 @@
 //! [`OAIChatLikeRequest`](crate::OAIChatLikeRequest): a top-level `thinking`
 //! field, guided-decoding fields, `continue_final_message`, and the raw prompt.
 
+mod handler;
 mod template;
 mod thinking;
 mod tool_arguments;
@@ -23,6 +27,10 @@ mod truthy;
 #[cfg(test)]
 mod tests;
 
+pub use handler::{
+    RequestApi, apply_handler_rules, apply_messages_thinking_defaults,
+    normalize_reasoning_template_args,
+};
 pub use template::{ChatPromptOptions, render_chat_prompt, should_add_generation_prompt};
 pub use thinking::{
     ChatTemplateArgs, ThinkingRules, apply_default_thinking_mode, has_guided_tool_choice,

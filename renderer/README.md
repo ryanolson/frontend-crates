@@ -50,6 +50,7 @@ Prompt-format tests do not replace live image-fetch, transfer, cache and backend
 - `reject_unsupported_reasoning_effort` refuses `reasoning_effort: none` for GPT-OSS.
 - `render_chat_prompt` renders with `continue_final_message`, a raw prompt in place of the template, and tool-call argument normalization (`should_normalize_tool_call_arguments`). Every failure is a `PromptRenderError::InvalidRequest`.
 - `should_add_generation_prompt` turns off the generation prompt when `continue_final_message` is set.
+- `apply_handler_rules` runs the rule that the Dynamo frontend's HTTP handler of each API applies first. Chat Completions and Responses run `normalize_reasoning_template_args`, which folds the top-level `thinking` and `reasoning_effort` into `chat_template_args`. Messages runs `apply_messages_thinking_defaults`, which turns on `enable_thinking` and keeps earlier reasoning (`truncate_history_thinking: false`) for a model with a reasoning parser, unless the client disabled thinking.
 
 The rules take plain values for what a request carries beyond `OAIChatLikeRequest`, such as a top-level `thinking` field. `tests/request_rules_parity` checks them against a frozen copy of the Dynamo code.
 

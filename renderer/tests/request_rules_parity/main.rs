@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dynamo_renderer::request_rules::{
-    ChatPromptOptions, ThinkingRules, has_minimax_m3_constrained_generation,
+    ChatPromptOptions, RequestApi, ThinkingRules, has_minimax_m3_constrained_generation,
     reject_unsupported_reasoning_effort, render_chat_prompt, should_normalize_tool_call_arguments,
 };
 use dynamo_renderer::{
@@ -626,4 +626,201 @@ fn raw_prompt_skips_message_materialization() {
         0,
         "raw prompts must bypass message materialization"
     );
+}
+
+/// Top-level `thinking` values: the three modes in both spellings, and the
+/// shapes the rule refuses.
+fn thinking_values() -> Vec<Option<Value>> {
+    vec![
+        None,
+        Some(json!(true)),
+        Some(json!(false)),
+        Some(json!({"type": "enabled"})),
+        Some(json!({"type": "disabled"})),
+        Some(json!({"type": "adaptive"})),
+        Some(json!({"type": "enabled", "budget_tokens": 1024})),
+        Some(json!({"type": "sometimes"})),
+        Some(json!({})),
+        Some(json!("on")),
+        Some(Value::Null),
+    ]
+}
+
+const REASONING_EFFORTS: &[Option<&str>] = &[
+    None,
+    Some("none"),
+    Some("minimal"),
+    Some("low"),
+    Some("medium"),
+    Some("high"),
+    Some("xhigh"),
+    Some("max"),
+];
+
+/// Argument maps over the thinking keys and a nested `reasoning_effort`,
+/// smaller than [`argument_maps`]: this rule reads each key's value.
+fn reasoning_argument_maps() -> Vec<Option<HashMap<String, Value>>> {
+    let values = [
+        None,
+        Some(json!(true)),
+        Some(json!(false)),
+        Some(json!("Enabled")),
+        Some(json!("disabled")),
+        Some(json!("ADAPTIVE")),
+        Some(Value::Null),
+    ];
+    let efforts = [
+        None,
+        Some(json!("low")),
+        Some(json!("none")),
+        Some(Value::Null),
+        Some(json!(7)),
+    ];
+    let mut maps = vec![None, Some(HashMap::new())];
+    for thinking in &values {
+        for thinking_mode in &values {
+            for effort in &efforts {
+                let mut map = HashMap::new();
+                for (key, value) in [
+                    ("thinking", thinking),
+                    ("thinking_mode", thinking_mode),
+                    ("reasoning_effort", effort),
+                ] {
+                    if let Some(value) = value {
+                        map.insert(key.to_string(), value.clone());
+                    }
+                }
+                map.insert("custom".to_string(), json!(1));
+                maps.push(Some(map));
+            }
+        }
+    }
+    maps
+}
+
+fn chat_request(
+    thinking: &Option<Value>,
+    effort: Option<&str>,
+    args: &Option<HashMap<String, Value>>,
+) -> NvCreateChatCompletionRequest {
+    let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+    if let Some(effort) = effort {
+        body["reasoning_effort"] = json!(effort);
+    }
+    let mut request: NvCreateChatCompletionRequest =
+        serde_json::from_value(body).expect("a chat request");
+    request.thinking = thinking.clone();
+    request.chat_template_args = args.clone();
+    request
+}
+
+/// The Chat Completions and Responses handlers' rule, on every combination
+/// of `thinking`, `reasoning_effort`, and template arguments: the same
+/// arguments, or the same error.
+#[test]
+fn reasoning_controls_match_dynamo() {
+    let mut cases = 0;
+    for thinking in thinking_values() {
+        for effort in REASONING_EFFORTS {
+            for args in reasoning_argument_maps() {
+                let mut stock = chat_request(&thinking, *effort, &args);
+                let stock_result = stock.normalize_reasoning_template_args();
+                let request = chat_request(&thinking, *effort, &args);
+                let mut moved = request.chat_template_args.clone();
+                let moved_result = dynamo_renderer::request_rules::apply_handler_rules(
+                    RequestApi::ChatCompletions,
+                    &request.inner,
+                    request.thinking.as_ref(),
+                    true,
+                    false,
+                    &mut moved,
+                );
+                match (&stock_result, &moved_result) {
+                    (Ok(()), Ok(())) => {
+                        assert_eq!(
+                            moved, stock.chat_template_args,
+                            "thinking {thinking:?}, effort {effort:?}, args {args:?}"
+                        );
+                        assert!(stock.thinking.is_none(), "the rule drops `thinking`");
+                    }
+                    (Err(stock), Err(moved)) => assert_eq!(stock.to_string(), moved.to_string()),
+                    _ => panic!(
+                        "thinking {thinking:?}, effort {effort:?}, args {args:?}: \
+                         stock {stock_result:?}, moved {moved_result:?}"
+                    ),
+                }
+                cases += 1;
+            }
+        }
+    }
+    assert!(cases > 3000, "control: the matrix is not empty ({cases})");
+}
+
+/// Responses runs the same rule as Chat Completions, and Messages does not.
+#[test]
+fn only_chat_and_responses_fold_reasoning_controls() {
+    let request = chat_request(&Some(json!({"type": "disabled"})), Some("high"), &None);
+    for (api, folded) in [
+        (RequestApi::ChatCompletions, true),
+        (RequestApi::Responses, true),
+        (RequestApi::Messages, false),
+    ] {
+        let mut args = None;
+        dynamo_renderer::request_rules::apply_handler_rules(
+            api,
+            &request.inner,
+            request.thinking.as_ref(),
+            false,
+            false,
+            &mut args,
+        )
+        .expect("valid");
+        assert_eq!(args.is_some(), folded, "{api:?}");
+    }
+}
+
+/// The Messages handler's thinking default, after the Messages conversion
+/// (`lib/llm/src/protocols/anthropic/types.rs:208-219`: `enabled` and
+/// `disabled` set `enable_thinking`, `adaptive` sets nothing).
+#[test]
+fn messages_thinking_default_matches_dynamo() {
+    let conversions: [(Option<&str>, Option<bool>); 4] = [
+        (None, None),
+        (Some("enabled"), Some(true)),
+        (Some("disabled"), Some(false)),
+        (Some("adaptive"), None),
+    ];
+    let mut cases = 0;
+    for reasoning_parser in REASONING_PARSERS {
+        for (thinking_type, enable) in conversions {
+            for extra in [None, Some(("truncate_history_thinking", json!(true)))] {
+                let mut args: Option<HashMap<String, Value>> = enable
+                    .map(|enable| HashMap::from([("enable_thinking".to_string(), json!(enable))]));
+                if let Some((key, value)) = &extra {
+                    args.get_or_insert_default()
+                        .insert(key.to_string(), value.clone());
+                }
+                let disabled = thinking_type == Some("disabled");
+                let mut stock = chat_request(&None, None, &args);
+                oracle::messages_thinking_default(*reasoning_parser, disabled, &mut stock);
+                let request = chat_request(&None, None, &args);
+                let mut moved = args.clone();
+                dynamo_renderer::request_rules::apply_handler_rules(
+                    RequestApi::Messages,
+                    &request.inner,
+                    None,
+                    reasoning_parser.is_some(),
+                    disabled,
+                    &mut moved,
+                )
+                .expect("Messages never fails");
+                assert_eq!(
+                    moved, stock.chat_template_args,
+                    "parser {reasoning_parser:?}, thinking {thinking_type:?}, extra {extra:?}"
+                );
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(cases, REASONING_PARSERS.len() * 8);
 }

@@ -983,3 +983,168 @@ impl OpenAIPreprocessor {
         }
     }
 }
+
+// ---- the HTTP handlers' rules ----
+// Copied from ai-dynamo/dynamo at `4943a661599e87e6ab7101be81774e605314d232`,
+// with the cited `path:line` ranges. Edits marked `ORACLE:`.
+
+// dynamo lib/llm/src/protocols/openai/chat_completions.rs:146-277
+impl NvCreateChatCompletionRequest {
+    /// Resolve the request's reasoning controls into `chat_template_args`.
+    /// Runs once at the HTTP boundary, so every render path reads one answer.
+    /// Model-specific overrides still apply later in the default preprocessor.
+    pub fn normalize_reasoning_template_args(&mut self) -> anyhow::Result<()> {
+        let thinking_mode = self
+            .thinking
+            .as_ref()
+            .map(openai_thinking_mode)
+            .transpose()?
+            .flatten();
+        // vLLM's order: an explicit top-level grade wins, else the nested one.
+        let reasoning_effort = self
+            .inner
+            .reasoning_effort
+            .as_ref()
+            .and_then(|effort| serde_json::to_value(effort).ok())
+            .or_else(|| {
+                self.chat_template_args
+                    .as_ref()
+                    .and_then(|args| args.get("reasoning_effort"))
+                    // `null` means the client set nothing.
+                    .filter(|effort| !effort.is_null())
+                    .cloned()
+            });
+
+        let has_template_control = self
+            .chat_template_args
+            .as_ref()
+            .is_some_and(|args| THINKING_KEYS.iter().any(|key| args.contains_key(*key)));
+        if thinking_mode.is_none() && reasoning_effort.is_none() && !has_template_control {
+            return Ok(());
+        }
+
+        let args = self.chat_template_args.get_or_insert_with(HashMap::new);
+        if let Some(mode) = thinking_mode {
+            match mode {
+                OpenAiThinkingMode::Enabled => set_thinking(args, true),
+                OpenAiThinkingMode::Disabled => set_thinking(args, false),
+                OpenAiThinkingMode::Adaptive => {
+                    // `adaptive` defers to the model, so no toggle may survive.
+                    args.remove("thinking");
+                    args.remove("enable_thinking");
+                    args.insert(
+                        "thinking_mode".to_string(),
+                        serde_json::Value::String("adaptive".to_string()),
+                    );
+                }
+            }
+        }
+        // Downstream readers compare modes case-insensitively; match them.
+        let mode = args
+            .get("thinking_mode")
+            .and_then(|v| v.as_str())
+            .map(str::to_ascii_lowercase);
+        // Highest wins, then it is stated in every dialect. Restating is the
+        // point: a decision left in one dialect reaches only the families that
+        // read it. A bool here is the client's own, because the root `adaptive`
+        // param cleared both above, so it outranks a nested mode.
+        let decided = THINKING_TOGGLES
+            .iter()
+            .find_map(|key| args.get(*key).and_then(|v| v.as_bool()))
+            .or_else(|| match mode.as_deref() {
+                // The model decides, so nothing is written.
+                Some("adaptive") => None,
+                Some("enabled") => Some(true),
+                Some("disabled") => Some(false),
+                // Only a string is a grade; anything else decides nothing.
+                _ => reasoning_effort
+                    .as_ref()
+                    .and_then(|effort| effort.as_str())
+                    .map(|effort| effort != "none"),
+            });
+        if let Some(on) = decided {
+            set_thinking(args, on);
+        }
+        if let Some(effort) = reasoning_effort {
+            args.insert("reasoning_effort".to_string(), effort);
+        }
+
+        // The raw `thinking` payload has been folded into `chat_template_args`;
+        // drop it so it isn't double-shipped downstream (and so it can't be
+        // re-interpreted with different precedence by the worker preprocessor).
+        self.thinking = None;
+        Ok(())
+    }
+}
+
+/// The two boolean dialects, in precedence order. `thinking_mode` carries the
+/// same decision as a string; families split over which one they read.
+const THINKING_TOGGLES: [&str; 2] = ["thinking", "enable_thinking"];
+const THINKING_KEYS: [&str; 3] = ["thinking", "enable_thinking", "thinking_mode"];
+
+fn set_thinking(args: &mut HashMap<String, serde_json::Value>, on: bool) {
+    args.insert("thinking".to_string(), serde_json::Value::Bool(on));
+    args.insert("enable_thinking".to_string(), serde_json::Value::Bool(on));
+    args.insert(
+        "thinking_mode".to_string(),
+        serde_json::Value::String(if on { "enabled" } else { "disabled" }.to_string()),
+    );
+}
+
+enum OpenAiThinkingMode {
+    Enabled,
+    Disabled,
+    Adaptive,
+}
+
+fn openai_thinking_mode(value: &serde_json::Value) -> anyhow::Result<Option<OpenAiThinkingMode>> {
+    if let Some(enabled) = value.as_bool() {
+        return Ok(Some(if enabled {
+            OpenAiThinkingMode::Enabled
+        } else {
+            OpenAiThinkingMode::Disabled
+        }));
+    }
+
+    let Some(thinking_object) = value.as_object() else {
+        anyhow::bail!(
+            "`thinking` must be a boolean or an object with `type` set to `enabled`, `disabled`, or `adaptive`"
+        );
+    };
+    let Some(thinking_type) = thinking_object.get("type").and_then(|v| v.as_str()) else {
+        anyhow::bail!("`thinking.type` must be `enabled`, `disabled`, or `adaptive`");
+    };
+    match thinking_type {
+        "enabled" => Ok(Some(OpenAiThinkingMode::Enabled)),
+        "disabled" => Ok(Some(OpenAiThinkingMode::Disabled)),
+        "adaptive" => Ok(Some(OpenAiThinkingMode::Adaptive)),
+        _ => anyhow::bail!("`thinking.type` must be `enabled`, `disabled`, or `adaptive`"),
+    }
+}
+
+/// ORACLE: the Messages handler's thinking default, as a function of what it
+/// reads: the parsing options' reasoning parser, and whether the Anthropic
+/// request disabled thinking (`anthropic.rs:556-559`).
+pub fn messages_thinking_default(
+    reasoning_parser: Option<&str>,
+    thinking_explicitly_disabled: bool,
+    chat_request: &mut NvCreateChatCompletionRequest,
+) {
+    // dynamo lib/llm/src/http/service/anthropic.rs:610-626
+    let prompt_injected_reasoning = reasoning_parser.is_some() && !thinking_explicitly_disabled;
+
+    if prompt_injected_reasoning {
+        let args = chat_request
+            .chat_template_args
+            .get_or_insert_with(Default::default);
+        args.entry("enable_thinking".to_string())
+            .or_insert(serde_json::Value::Bool(true));
+        // Preserve reasoning from prior turns. Some templates (Nemotron)
+        // strip historical <think> content by default to save context.
+        // For agentic flows the model needs to see why it made prior decisions.
+        // Ref: NVIDIA's SWE training config also sets this to false:
+        // https://github.com/NVIDIA-NeMo/Nemotron/blob/main/src/nemotron/recipes/super3/stage2_rl/stage2_swe2/config/default.yaml#L287
+        args.entry("truncate_history_thinking".to_string())
+            .or_insert(serde_json::Value::Bool(false));
+    }
+}
