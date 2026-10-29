@@ -159,6 +159,7 @@ fn with_sources(chunks: &[Annotated<CreateChatCompletionStreamResponse>]) -> Vec
                 })
                 .collect();
             SourcedChunk {
+                held: None,
                 chunk: chunk.clone(),
                 sources: Some(sources),
             }
@@ -222,6 +223,7 @@ async fn check(
         .iter()
         .cloned()
         .map(|chunk| SourcedChunk {
+            held: None,
             chunk,
             sources: None,
         })

@@ -152,6 +152,7 @@ fn recording_on_the_v1_route_allocates_little_per_chunk() {
                             let start = offset;
                             offset += c.len();
                             SourcedChunk {
+                                held: None,
                                 chunk: chunk(c),
                                 sources: Some(vec![ChoiceSources {
                                     index: 0,

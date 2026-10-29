@@ -208,6 +208,7 @@ async fn run(case: &Value, record: bool, fold: bool, defer: bool) -> Vec<Sourced
             None => (None, None),
         };
         SourcedChunk {
+            held: None,
             chunk: Annotated {
                 data,
                 id: item.id,

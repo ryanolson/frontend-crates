@@ -67,6 +67,7 @@ fn sourced(stream: &[(bool, String)]) -> Vec<SourcedChunk> {
                 (vec![range], Vec::new())
             };
             SourcedChunk {
+                held: None,
                 chunk: chunk(*reasoning, text),
                 sources: Some(vec![ChoiceSources {
                     index: 0,

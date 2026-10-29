@@ -98,16 +98,42 @@ pub(crate) trait JailItem: Send + 'static {
     /// Whether this item type can carry sources.
     const RECORDS: bool;
 
+    /// What the item carries of the jail's held report: nothing for an item
+    /// that cannot report, so a stream that keeps it costs nothing.
+    type Held: Clone + Send + 'static;
+
     fn into_parts(self) -> SourcedItem;
 
     fn from_parts(item: SourcedItem) -> Self;
 
     /// The item's sources, `None` when it carries none.
     fn sources_mut(&mut self) -> Option<&mut Vec<ChoiceSources>>;
+
+    /// Record what the jail still holds when the item goes out. Only an
+    /// item that reports it keeps it.
+    #[inline]
+    fn set_held(&mut self, _held: Vec<ChoiceSources>) {}
+
+    /// The item's parts, and its held report. By value, so no borrow keeps
+    /// the item in a stream's frame.
+    fn into_parts_held(self) -> (SourcedItem, Self::Held);
+
+    /// Put back a held report that [`into_parts_held`](Self::into_parts_held)
+    /// took.
+    fn put_held(&mut self, held: Self::Held);
 }
 
 impl JailItem for Annotated<CreateChatCompletionStreamResponse> {
     const RECORDS: bool = false;
+    type Held = ();
+
+    #[inline]
+    fn into_parts_held(self) -> (SourcedItem, ()) {
+        ((self, None), ())
+    }
+
+    #[inline]
+    fn put_held(&mut self, _held: ()) {}
 
     #[inline]
     fn into_parts(self) -> SourcedItem {
@@ -127,6 +153,15 @@ impl JailItem for Annotated<CreateChatCompletionStreamResponse> {
 
 impl JailItem for SourcedItem {
     const RECORDS: bool = true;
+    type Held = ();
+
+    #[inline]
+    fn into_parts_held(self) -> (SourcedItem, ()) {
+        (self, ())
+    }
+
+    #[inline]
+    fn put_held(&mut self, _held: ()) {}
 
     #[inline]
     fn into_parts(self) -> SourcedItem {
@@ -146,6 +181,7 @@ impl JailItem for SourcedItem {
 
 impl JailItem for SourcedChunk {
     const RECORDS: bool = true;
+    type Held = Option<Vec<ChoiceSources>>;
 
     #[inline]
     fn into_parts(self) -> SourcedItem {
@@ -154,13 +190,98 @@ impl JailItem for SourcedChunk {
 
     #[inline]
     fn from_parts((chunk, sources): SourcedItem) -> Self {
-        SourcedChunk { chunk, sources }
+        SourcedChunk {
+            chunk,
+            sources,
+            held: None,
+        }
     }
 
     #[inline]
     fn sources_mut(&mut self) -> Option<&mut Vec<ChoiceSources>> {
         self.sources.as_mut()
     }
+
+    #[inline]
+    fn set_held(&mut self, held: Vec<ChoiceSources>) {
+        self.held = Some(held);
+    }
+
+    #[inline]
+    fn into_parts_held(self) -> (SourcedItem, Option<Vec<ChoiceSources>>) {
+        ((self.chunk, self.sources), self.held)
+    }
+
+    #[inline]
+    fn put_held(&mut self, held: Option<Vec<ChoiceSources>>) {
+        self.held = held;
+    }
+}
+
+/// Add `item`'s text ranges to `held`, the text still to come when an earlier
+/// item went out.
+fn hold_item_text<I: JailItem>(item: &mut I, held: &mut Vec<ChoiceSources>) {
+    let Some(sources) = item.sources_mut() else {
+        return;
+    };
+    for source in sources.iter() {
+        add_held(held, source.index, &source.content, &source.reasoning);
+    }
+}
+
+/// Add choice `index`'s `content` and `reasoning` ranges to `held`.
+fn add_held(
+    held: &mut Vec<ChoiceSources>,
+    index: u32,
+    content: &[std::ops::Range<usize>],
+    reasoning: &[std::ops::Range<usize>],
+) {
+    if content.is_empty() && reasoning.is_empty() {
+        return;
+    }
+    let at = match held.iter().position(|entry| entry.index == index) {
+        Some(at) => at,
+        None => {
+            held.push(ChoiceSources {
+                index,
+                ..ChoiceSources::default()
+            });
+            held.len() - 1
+        }
+    };
+    let entry = &mut held[at];
+    entry.content.extend(content.iter().cloned());
+    entry.content.sort_unstable_by_key(|range| range.start);
+    entry.reasoning.extend(reasoning.iter().cloned());
+    entry.reasoning.sort_unstable_by_key(|range| range.start);
+}
+
+/// What the jail holds as a group of one input's output goes out: `held`
+/// after the input, and the text of the `later` groups.
+fn held_before(
+    mut held: Vec<ChoiceSources>,
+    later: &[&[Emitted]],
+    unsourced: &HashSet<u32>,
+) -> Vec<ChoiceSources> {
+    for emitted in later.iter().flat_map(|group| group.iter()) {
+        emitted.hold_text(&mut held, unsourced);
+    }
+    held
+}
+
+/// Stamp each of `items`, one input's output in order, with what the jail
+/// holds when it goes out: `held` after the input, and the text of the
+/// items after it, which was still held then.
+/// Allocates only while text is held: the first item's text is never added.
+fn stamp_held<I: JailItem>(items: &mut [I], mut held: Vec<ChoiceSources>) {
+    let Some((first, later)) = items.split_first_mut() else {
+        return;
+    };
+    for item in later.iter_mut().rev() {
+        item.set_held(held.clone());
+        hold_item_text(item, &mut held);
+    }
+    first.set_held(held);
 }
 
 fn is_harmony_parser(parser: Option<&str>) -> bool {
@@ -466,6 +587,25 @@ struct EmittedSpans {
 }
 
 impl Emitted {
+    /// Add this emission's text ranges to `held`, unless its choice has no
+    /// source.
+    fn hold_text(&self, held: &mut Vec<ChoiceSources>, unsourced: &HashSet<u32>) {
+        let Self::Sourced(sourced) = self else {
+            return;
+        };
+        let (emission, spans) = &**sourced;
+        let index = emission.index();
+        if unsourced.contains(&index) {
+            return;
+        }
+        add_held(
+            held,
+            index,
+            spans.content.ranges(),
+            spans.reasoning.ranges(),
+        );
+    }
+
     fn new(emission: ChoiceEmission, content: Spans) -> Self {
         if content.is_recording() {
             let reasoning = Spans::recording(true);
@@ -2108,6 +2248,40 @@ impl ChoiceJailStateCollection {
         Self { states: Vec::new() }
     }
 
+    /// The input ranges of the text each recording choice still holds, with
+    /// no entry for a choice that holds none. A choice in `unsourced` gets no
+    /// entry either: its offsets are not the caller's, and its `sources`
+    /// entry is missing too, so the caller can tell. Allocates only while
+    /// text is held.
+    fn held(&self, unsourced: &HashSet<u32>) -> Vec<ChoiceSources> {
+        let mut held = Vec::new();
+        for state in &self.states {
+            if unsourced.contains(&state.index) {
+                continue;
+            }
+            let content: Vec<_> = [
+                &state.accumulated_spans,
+                &state.partial_spans,
+                &state.terminal_suffix_spans,
+            ]
+            .into_iter()
+            .flat_map(|spans| spans.ranges().iter().cloned())
+            .collect();
+            let reasoning = state.pending_reasoning_spans.ranges();
+            if content.is_empty() && reasoning.is_empty() {
+                continue;
+            }
+            let mut content = content;
+            content.sort_unstable_by_key(|range| range.start);
+            held.push(ChoiceSources {
+                index: state.index,
+                content,
+                reasoning: reasoning.to_vec(),
+            });
+        }
+        held
+    }
+
     /// Get or create state for a choice index
     fn get_or_create_state(
         &mut self,
@@ -2331,7 +2505,14 @@ impl JailedStream {
                     if chat_response.choices.is_empty() {
                         // No choices processed (e.g., usage-only chunk)
                         // Pass through as-is to preserve usage and other metadata
-                        yield I::from_parts((response, recording.then(Vec::new)));
+                        // A block, so no binding lives across the yield.
+                        yield {
+                            let mut item = I::from_parts((response, recording.then(Vec::new)));
+                            if recording {
+                                item.set_held(choice_states.held(&unsourced));
+                            }
+                            item
+                        };
                         continue;
                     }
 
@@ -2543,46 +2724,90 @@ impl JailedStream {
                         // normalizer assigns `finish_reason` to the last emission, so this bucket
                         // order must stay aligned or terminal ownership must move after bucketing.
                         // Emit pass-through prefixes before parsed tool calls.
+                        // While recording, each item reports what the jail holds as
+                        // it goes out: what it holds after this input, and the text
+                        // of the items after it, built here before they go out.
                         if !passthrough_emissions.is_empty() {
-                            let current_metadata = (response.id.clone(), response.event.clone(), response.comment.clone());
-                            let responses: Vec<I> = self.emit_choice_emissions(passthrough_emissions, chat_response, current_metadata);
-                            for mut emitted_response in responses {
-                                drop_unsourced(&unsourced, &mut emitted_response);
+                            let responses: Vec<I> = {
+                                let held = recording.then(|| held_before(
+                                    choice_states.held(&unsourced),
+                                    &[&tool_content_emissions, &trailing_emissions],
+                                    &unsourced,
+                                ));
+                                let current_metadata = (response.id.clone(), response.event.clone(), response.comment.clone());
+                                let mut responses: Vec<I> = self.emit_choice_emissions(passthrough_emissions, chat_response, current_metadata);
+                                for emitted_response in &mut responses {
+                                    drop_unsourced(&unsourced, emitted_response);
+                                }
+                                if let Some(held) = held {
+                                    stamp_held(&mut responses, held);
+                                }
+                                responses
+                            };
+                            for emitted_response in responses {
                                 yield emitted_response;
                             }
                         }
 
                         // Emit tool calls and content with preserved metadata.
                         if !tool_content_emissions.is_empty() {
-                            let preserved_metadata = (
-                                last_annotated_id.clone(),
-                                last_annotated_event.clone(),
-                                last_annotated_comment.clone(),
-                            );
-                            let responses: Vec<I> = self.emit_choice_emissions(tool_content_emissions, chat_response, preserved_metadata);
-                            for mut emitted_response in responses {
-                                drop_unsourced(&unsourced, &mut emitted_response);
+                            let responses: Vec<I> = {
+                                let held = recording.then(|| held_before(
+                                    choice_states.held(&unsourced),
+                                    &[&trailing_emissions],
+                                    &unsourced,
+                                ));
+                                let preserved_metadata = (
+                                    last_annotated_id.clone(),
+                                    last_annotated_event.clone(),
+                                    last_annotated_comment.clone(),
+                                );
+                                let mut responses: Vec<I> = self.emit_choice_emissions(tool_content_emissions, chat_response, preserved_metadata);
+                                for emitted_response in &mut responses {
+                                    drop_unsourced(&unsourced, emitted_response);
+                                }
+                                if let Some(held) = held {
+                                    stamp_held(&mut responses, held);
+                                }
+                                responses
+                            };
+                            for emitted_response in responses {
                                 yield emitted_response;
                             }
                         }
 
                         // Emit trailing content after its parsed tool call.
                         if !trailing_emissions.is_empty() {
-                            let preserved_metadata = (
-                                last_annotated_id.clone(),
-                                last_annotated_event.clone(),
-                                last_annotated_comment.clone(),
-                            );
-                            let responses: Vec<I> = self.emit_choice_emissions(trailing_emissions, chat_response, preserved_metadata);
-                            for mut emitted_response in responses {
-                                drop_unsourced(&unsourced, &mut emitted_response);
+                            let responses: Vec<I> = {
+                                let held = recording.then(|| choice_states.held(&unsourced));
+                                let preserved_metadata = (
+                                    last_annotated_id.clone(),
+                                    last_annotated_event.clone(),
+                                    last_annotated_comment.clone(),
+                                );
+                                let mut responses: Vec<I> = self.emit_choice_emissions(trailing_emissions, chat_response, preserved_metadata);
+                                for emitted_response in &mut responses {
+                                    drop_unsourced(&unsourced, emitted_response);
+                                }
+                                if let Some(held) = held {
+                                    stamp_held(&mut responses, held);
+                                }
+                                responses
+                            };
+                            for emitted_response in responses {
                                 yield emitted_response;
                             }
                         }
                     }
                 } else {
                     // No response data, pass through as-is
-                    yield I::from_parts((response, recording.then(Vec::new)));
+                    yield {
+                        let mut item = I::from_parts((response, recording.then(Vec::new)));
+                        if recording {
+                            item.set_held(choice_states.held(&unsourced));
+                        }
+                        item
+                    };
                 }
             }
 
@@ -2612,9 +2837,14 @@ impl JailedStream {
                 };
 
                 let final_metadata = (last_annotated_id, last_annotated_event, last_annotated_comment);
-                let responses: Vec<I> = self.emit_choice_emissions(final_emissions, &dummy_response, final_metadata);
-                for mut emitted_response in responses {
-                    drop_unsourced(&unsourced, &mut emitted_response);
+                let mut responses: Vec<I> = self.emit_choice_emissions(final_emissions, &dummy_response, final_metadata);
+                for emitted_response in &mut responses {
+                    drop_unsourced(&unsourced, emitted_response);
+                }
+                if recording {
+                    stamp_held(&mut responses, choice_states.held(&unsourced));
+                }
+                for emitted_response in responses {
                     yield emitted_response;
                 }
             }
@@ -3482,7 +3712,7 @@ impl JailedStream {
 
             let mut unsourced: HashSet<u32> = HashSet::new();
             while let Some(item) = input_stream.next().await {
-                let (mut response, sources) = item.into_parts();
+                let ((mut response, sources), held) = item.into_parts_held();
                 // While recording, the jail gives every choice an entry unless
                 // its text has no source.
                 if let (Some(sources), Some(data)) = (&sources, &response.data) {
@@ -3558,21 +3788,31 @@ impl JailedStream {
                         .collect();
                     indices.sort_unstable();
                     for index in indices {
-                        yield I::from_parts((
-                            stream_choice_chunk_from_template(
-                                template,
-                                index,
-                                None,
-                                None,
-                                Some(FinishReason::ToolCalls),
-                            ),
-                            added(index, &unsourced),
-                        ));
+                        // Blocks, so no binding lives across the yield.
+                        yield {
+                            let mut added_item = I::from_parts((
+                                stream_choice_chunk_from_template(
+                                    template,
+                                    index,
+                                    None,
+                                    None,
+                                    Some(FinishReason::ToolCalls),
+                                ),
+                                added(index, &unsourced),
+                            ));
+                            // It goes out before the item: the same text is held.
+                            added_item.put_held(held.clone());
+                            added_item
+                        };
                         synthesized.insert(index);
                     }
                 }
 
-                yield I::from_parts((response, sources));
+                yield {
+                    let mut item = I::from_parts((response, sources));
+                    item.put_held(held);
+                    item
+                };
             }
 
             // Backstop: the stream ended without a finish_reason AND without an
@@ -3592,16 +3832,23 @@ impl JailedStream {
                     .collect();
                 indices.sort_unstable();
                 for index in indices {
-                    yield I::from_parts((
-                        stream_choice_chunk_from_template(
-                            &template,
-                            index,
-                            None,
-                            None,
-                            Some(FinishReason::ToolCalls),
-                        ),
-                        added(index, &unsourced),
-                    ));
+                    yield {
+                        let mut added_item = I::from_parts((
+                            stream_choice_chunk_from_template(
+                                &template,
+                                index,
+                                None,
+                                None,
+                                Some(FinishReason::ToolCalls),
+                            ),
+                            added(index, &unsourced),
+                        ));
+                        // The stream ended: the jail holds nothing.
+                        if recording {
+                            added_item.set_held(Vec::new());
+                        }
+                        added_item
+                    };
                     synthesized.insert(index);
                 }
             }
