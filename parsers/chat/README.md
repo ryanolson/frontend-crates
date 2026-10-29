@@ -16,6 +16,7 @@ The rules an OpenAI chat frontend uses to pick and drive Dynamo's parsers. The p
 | `special_tokens` | The `skip_special_tokens` default for each parser. |
 | `stop_tokens` | A tool-call end token that is a hidden EOS becomes a visible stop. |
 | `tools` | The effective tools (top-level and system-message tools) and the tool-parsing gate. |
+| `tool_choice` | The grammar a forced `tool_choice` installs (a JSON schema, or an exact regex for a tool that takes only `{}`), and the `GuidedToolConstraint` a request implies. The caller passes in whether the request's own `guided_*` fields install a grammar. |
 | `unified_stream` | The v2 stream adapter: one unified parser per choice turns raw model text into reasoning, content, and tool-call chunks, then fixes each choice's finish reason. Also the batch parse of a whole reply. |
 | `aggregator` | The non-streaming finalize: the chunks of a `stream: false` reply become one response. It re-parses the text when no tool call came through, drops cut-off calls, and can move reasoning to content. |
 | `stream_item` | The stream item that `unified_stream` reads. Dynamo implements it for its own item, so its per-chunk fields (`nvext`, metrics, completion evidence) stay in place. A chunk with a `SourceSlot` (from `dynamo-parsers`) also gets, for each choice, the input byte ranges its text came from. |
@@ -49,3 +50,5 @@ cargo test -p dynamo-chat-parsing
 `tests/stream_policies_parity.rs` does the same for `parse_chat_stream` and the stream policies, with two fixtures: a matrix of parser pairs, requests, and streams recorded by `tests/data/stream_policies_recorder.rs`, and every call that dynamo-llm's own tests make, captured by `tests/data/stream_policies_capture.rs`. dynamo-llm's unit tests for the policies are in `src/stream_policies_tests.rs`.
 
 `AggregatorOptions::for_request` builds the aggregator's options as dynamo-llm's HTTP handlers do; `tests/aggregator_options_parity.rs` checks it against a copy of their code.
+
+`tests/tool_choice_parity.rs` checks `tool_choice` against a copy of dynamo-llm's code, over generated tool lists, tool choices, and requests. dynamo-llm's unit tests for it are in `src/tool_choice_tests.rs`.
