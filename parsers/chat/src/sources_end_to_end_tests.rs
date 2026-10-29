@@ -629,3 +629,87 @@ fn v2_adapter_cost() {
         }
     }
 }
+
+/// Instruction counts of the v2 adapter and the response policies, for
+/// callgrind: `V2_PASSES` passes (default 1) over the corpus's qwen3 cases,
+/// with recording off, or on when `V2_RECORD=1`, then the chunk count. The
+/// difference of the "Collected" totals at two pass counts, over the extra
+/// passes times the chunk count, is the Ir per chunk with setup cancelled.
+#[test]
+#[ignore = "instruction count: run under callgrind"]
+fn v2_adapter_passes() {
+    let passes: usize = std::env::var("V2_PASSES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let record = std::env::var("V2_RECORD").is_ok_and(|value| value == "1");
+    let family = "qwen3";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let inputs: Vec<(Value, Vec<Annotated<Slot>>)> = corpus()
+        .into_iter()
+        .filter(|case| case["family"] == family)
+        .filter(|case| {
+            let constraint: GuidedToolConstraint =
+                serde_json::from_value(case["constraint"].clone()).unwrap();
+            !constraint.installs_guided_json() && !refuses_by_design(case)
+        })
+        .map(|case| {
+            let items = input(&case, record).0;
+            (case, items)
+        })
+        .collect();
+    let chunks: usize = inputs.iter().map(|(_, items)| items.len()).sum();
+    for _ in 0..passes {
+        runtime.block_on(async {
+            for (case, items) in &inputs {
+                let constraint: GuidedToolConstraint =
+                    serde_json::from_value(case["constraint"].clone()).unwrap();
+                let prefill = StreamPrefill {
+                    starting_state: match case["prefill"].as_str().unwrap() {
+                        "reasoning" => UnifiedParserStartingState::Reasoning,
+                        "response" => UnifiedParserStartingState::Response,
+                        _ => UnifiedParserStartingState::None,
+                    },
+                    prefix: None,
+                };
+                let adapted = apply_stream_with_policy(
+                    futures::stream::iter(items.clone()),
+                    case["tools"].as_bool().unwrap().then(weather_tools),
+                    constraint,
+                    prefill,
+                    family,
+                    case["guided_streaming"].as_bool().unwrap(),
+                    UnifiedRequestPolicy {
+                        reasoning_disabled: case["reasoning_disabled"].as_bool().unwrap(),
+                        structured_response: case["structured_response"].as_bool().unwrap(),
+                        parsers_v2_selected: false,
+                    },
+                )
+                .map(|item: Annotated<Slot>| {
+                    let (data, sources) = match item.data {
+                        Some(slot) => (Some(slot.inner), slot.slot),
+                        None => (None, None),
+                    };
+                    SourcedChunk {
+                        chunk: Annotated {
+                            data,
+                            id: item.id,
+                            event: item.event,
+                            comment: item.comment,
+                            error: item.error,
+                        },
+                        sources,
+                    }
+                });
+                let out: Vec<SourcedChunk> =
+                    apply_unified_response_policies(adapted, true, false, false)
+                        .collect()
+                        .await;
+                std::hint::black_box(out);
+            }
+        });
+    }
+    println!("v2 chunks per pass: {chunks}, passes: {passes}, record: {record}");
+}
