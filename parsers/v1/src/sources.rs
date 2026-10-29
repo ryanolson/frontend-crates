@@ -143,18 +143,43 @@ pub(crate) fn push_run(runs: &mut Vec<SourceRun>, channel: SourceChannel, input:
 ///
 /// The ranges tile the string: their lengths add up to its byte length, and
 /// byte `i` of the string came from the input byte that this list maps it to.
-/// `None` means recording is off. Every operation then does nothing, so the
-/// stock path pays one `None` check per edit and allocates nothing.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Spans(Option<Vec<Range<usize>>>);
+/// [`Spans::OFF`] means recording is off. Every operation then does nothing,
+/// so the stock path pays one check per edit and allocates nothing.
+///
+/// Most strings come from one stretch of input, so one range is held inline
+/// and a list is allocated only for two or more. A list per string cost
+/// recording about one allocation per chunk in each stage that holds text.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Spans(Repr);
+
+/// Two lists are equal when both record, or both do not, and hold the same
+/// ranges, however they are stored.
+impl PartialEq for Spans {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_recording() == other.is_recording() && self.ranges() == other.ranges()
+    }
+}
+
+impl Eq for Spans {}
+
+/// The same size as `Option<Vec<Range<usize>>>`: the one-range variant fits
+/// beside the list's niche.
+#[derive(Clone, Debug, Default)]
+enum Repr {
+    #[default]
+    Off,
+    Empty,
+    One(Range<usize>),
+    Many(Vec<Range<usize>>),
+}
 
 impl Spans {
     /// No recording.
-    pub(crate) const OFF: Spans = Spans(None);
+    pub(crate) const OFF: Spans = Spans(Repr::Off);
 
     /// An empty list when `on`, else [`Spans::OFF`].
     pub(crate) fn recording(on: bool) -> Self {
-        Spans(on.then(Vec::new))
+        Spans(if on { Repr::Empty } else { Repr::Off })
     }
 
     /// One contiguous range, when `on`.
@@ -165,16 +190,24 @@ impl Spans {
     }
 
     pub(crate) fn is_recording(&self) -> bool {
-        self.0.is_some()
+        !matches!(self.0, Repr::Off)
     }
 
     /// The ranges, or none when recording is off.
     pub(crate) fn ranges(&self) -> &[Range<usize>] {
-        self.0.as_deref().unwrap_or(&[])
+        match &self.0 {
+            Repr::Off | Repr::Empty => &[],
+            Repr::One(range) => std::slice::from_ref(range),
+            Repr::Many(ranges) => ranges,
+        }
     }
 
     pub(crate) fn into_ranges(self) -> Vec<Range<usize>> {
-        self.0.unwrap_or_default()
+        match self.0 {
+            Repr::Off | Repr::Empty => Vec::new(),
+            Repr::One(range) => vec![range],
+            Repr::Many(ranges) => ranges,
+        }
     }
 
     /// The number of string bytes these ranges cover.
@@ -184,24 +217,27 @@ impl Spans {
 
     /// Appends the source of bytes added at the end of the string.
     pub(crate) fn push(&mut self, input: Range<usize>) {
-        let Some(ranges) = self.0.as_mut() else {
-            return;
-        };
         if input.is_empty() {
             return;
         }
-        if let Some(last) = ranges.last_mut()
-            && last.end == input.start
-        {
-            last.end = input.end;
-            return;
+        match &mut self.0 {
+            Repr::Off => {}
+            Repr::Empty => self.0 = Repr::One(input),
+            Repr::One(last) if last.end == input.start => last.end = input.end,
+            Repr::One(last) => {
+                let first = last.clone();
+                self.0 = Repr::Many(vec![first, input]);
+            }
+            Repr::Many(ranges) => match ranges.last_mut() {
+                Some(last) if last.end == input.start => last.end = input.end,
+                _ => ranges.push(input),
+            },
         }
-        ranges.push(input);
     }
 
     /// Appends the sources of a string appended at the end of this one.
     pub(crate) fn append(&mut self, other: &Spans) {
-        if self.0.is_none() {
+        if !self.is_recording() {
             return;
         }
         for range in other.ranges() {
@@ -211,22 +247,24 @@ impl Spans {
 
     /// Puts the sources of a string inserted at the front before these.
     pub(crate) fn prepend(&mut self, mut front: Spans) {
-        if self.0.is_none() {
+        if !self.is_recording() {
             return;
         }
-        front.0.get_or_insert_with(Vec::new);
+        if !front.is_recording() {
+            front = Spans::recording(true);
+        }
         front.append(self);
         *self = front;
     }
 
     /// The sources of string bytes `at`.
     pub(crate) fn slice(&self, at: Range<usize>) -> Spans {
-        let Some(ranges) = self.0.as_ref() else {
+        if !self.is_recording() {
             return Spans::OFF;
-        };
-        let mut out = Spans(Some(Vec::new()));
+        }
+        let mut out = Spans::recording(true);
         let mut offset = 0;
-        for range in ranges {
+        for range in self.ranges() {
             let (start, end) = (offset, offset + range.len());
             offset = end;
             if end <= at.start {
@@ -245,7 +283,7 @@ impl Spans {
 
     /// Drops the sources of the first `n` string bytes.
     pub(crate) fn drain_front(&mut self, n: usize) {
-        if self.0.is_none() || n == 0 {
+        if !self.is_recording() || n == 0 {
             return;
         }
         let total = self.len();
@@ -254,7 +292,7 @@ impl Spans {
 
     /// Splits off the sources of string bytes `at..`, as `String::split_off`.
     pub(crate) fn split_off(&mut self, at: usize) -> Spans {
-        if self.0.is_none() {
+        if !self.is_recording() {
             return Spans::OFF;
         }
         let total = self.len();
@@ -265,7 +303,7 @@ impl Spans {
 
     /// Drops the sources of string bytes `at`, which were cut out of the middle.
     pub(crate) fn remove(&mut self, at: Range<usize>) {
-        if self.0.is_none() || at.is_empty() {
+        if !self.is_recording() || at.is_empty() {
             return;
         }
         let total = self.len();
@@ -274,16 +312,19 @@ impl Spans {
         self.append(&tail);
     }
 
+    /// Empties the list. A list of two or more keeps its buffer.
     pub(crate) fn clear(&mut self) {
-        if let Some(ranges) = self.0.as_mut() {
-            ranges.clear();
+        match &mut self.0 {
+            Repr::Off | Repr::Empty => {}
+            Repr::One(_) => self.0 = Repr::Empty,
+            Repr::Many(ranges) => ranges.clear(),
         }
     }
 
     /// Maps `local`, ranges over the string these spans describe, to input
     /// ranges.
     pub(crate) fn map(&self, local: &Spans) -> Spans {
-        if self.0.is_none() {
+        if !self.is_recording() {
             return Spans::OFF;
         }
         debug_assert!(local.is_recording(), "mapping text that recorded no ranges");
@@ -296,10 +337,10 @@ impl Spans {
 
     /// Takes the ranges out, leaving an empty list that still records.
     pub(crate) fn take(&mut self) -> Spans {
-        match self.0.as_mut() {
-            Some(ranges) => Spans(Some(std::mem::take(ranges))),
-            None => Spans::OFF,
+        if !self.is_recording() {
+            return Spans::OFF;
         }
+        std::mem::replace(self, Spans::recording(true))
     }
 }
 
@@ -458,6 +499,24 @@ mod tests {
             spans.push(range.clone());
         }
         spans
+    }
+
+    /// One range is held inline, and the list is no larger than before.
+    #[test]
+    fn one_range_is_inline_and_the_list_keeps_its_size() {
+        assert_eq!(
+            std::mem::size_of::<Spans>(),
+            std::mem::size_of::<Option<Vec<Range<usize>>>>()
+        );
+        let mut one = Spans::recording(true);
+        one.push(3..5);
+        one.push(5..9);
+        assert!(matches!(one.0, Repr::One(ref range) if *range == (3..9)));
+        one.push(12..13);
+        assert_eq!(one.ranges(), &[3..9, 12..13]);
+        one.clear();
+        assert_eq!(one, Spans::recording(true));
+        assert_ne!(one, Spans::OFF);
     }
 
     #[test]
