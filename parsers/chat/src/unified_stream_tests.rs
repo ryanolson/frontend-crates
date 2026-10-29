@@ -5051,7 +5051,7 @@ async fn qwen_queued_reasoning_preserves_choice_envelope_on_resolution_and_eof()
                             Annotated<NvCreateChatCompletionStreamResponse>,
                         > {
                             text: "detour".into(),
-                            spans: Vec::new(),
+                            spans: Spans::new(),
                             choice: expected.clone(),
                             data: source.data.clone().unwrap(),
                             annotation: (
@@ -8681,3 +8681,20 @@ async fn disabled_gemma_preserves_thought_delimiters_around_native_calls_at_ever
 #[path = "unified_stream_sources_tests.rs"]
 #[allow(clippy::single_range_in_vec_init)]
 mod sources;
+
+/// With recording off, `Deltas` is 56 bytes: the per-run range lists hold
+/// one list inline, which cannot share a niche with the vector form, so the
+/// field grew from 24 to 32 bytes. Callgrind on brev counted the stock adapter
+/// at 0.10% fewer instructions per chunk than with a vector there, and the
+/// inline list saves 2.5 allocations per token with recording on, so the size
+/// is kept. It must not grow further.
+#[test]
+fn recording_off_deltas_keep_their_size() {
+    let deltas = Deltas::new(false);
+    assert!(deltas.spans.is_none());
+    let actual = std::mem::size_of_val(&deltas);
+    assert!(
+        actual <= 56,
+        "recording-off Deltas is {actual} bytes; bound 56"
+    );
+}
