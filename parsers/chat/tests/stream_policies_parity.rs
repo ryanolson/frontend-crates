@@ -44,6 +44,17 @@
 //! computed it. A record's name is the test that made the call. The capture
 //! code is `tests/data/stream_policies_capture.rs`.
 //!
+//! One change in dynamo since `45e30e07` is pinned by kind
+//! ([`gpt_oss_reasoning_kept`]): dynamo `37f2f0a712`
+//! (`lib/llm/src/preprocessor.rs:7161`) does not let a request turn GPT-OSS's
+//! reasoning off, because the model cannot. So with a thinking-off flag, a
+//! GPT-OSS `predicates` record answers `false` where the recording says `true`,
+//! and a GPT-OSS `stream` record sends the analysis as reasoning where the
+//! recording sent it as answer text. Such a stream record must send exactly
+//! what dynamo recorded for its twin, the same input with no thinking flag
+//! ([`reasoning_on_twin`]). Exactly 12 `predicates` and 53 `stream` records
+//! differ that way, and no other record differs.
+//!
 //! Chunks leave out the fixed envelope (`id`, `object`, `created`, `model`)
 //! and null fields. dynamo's `llm_metrics` is written as its `chunk_tokens`
 //! value, and `prompt_logprobs` as its length. Generated tool-call IDs are
@@ -51,7 +62,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use dynamo_chat_parsing::chat_stream::{
     ChatStreamParsers, ChatStreamPlan, JailRequest, PolicyStreamItem, parse_chat_stream,
@@ -685,9 +696,107 @@ fn fixture_items_round_trip() {
     }
 }
 
+/// Whether the record is a GPT-OSS one: the parser pair's unified family is
+/// `gpt_oss`.
+fn is_gpt_oss(record: &Value) -> bool {
+    let (tool, reasoning) = parsers(record);
+    selected_family(tool, reasoning, version(record)) == Some("gpt_oss")
+}
+
+/// A GPT-OSS `predicates` record whose mismatches are exactly the reasoning-off
+/// rule answering `false`, with the family, for each default thinking mode that
+/// the recording answered `true`: dynamo `37f2f0a712` keeps GPT-OSS reasoning on
+/// (`preprocessor.rs:7161`) whatever the mode. Every such mode must differ, and
+/// nothing else may.
+fn gpt_oss_rule_kept(record: &Value, mismatches: &[String]) -> bool {
+    let expected: Vec<String> = record["request_disables_reasoning"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["with_family"] == json!(true))
+        .map(|entry| {
+            format!(
+                "request_disables_reasoning_with_family({:?}, family): got false, dynamo true",
+                entry["default_thinking_mode"].as_str()
+            )
+        })
+        .collect();
+    is_gpt_oss(record) && !expected.is_empty() && mismatches == expected.as_slice()
+}
+
+/// Whether the record's request turns thinking off in its template
+/// arguments: `enable_thinking: false` or `thinking_mode: disabled`.
+fn turns_thinking_off(record: &Value) -> bool {
+    let args = &record["request"]["chat_template_args"];
+    args["enable_thinking"] == json!(false) || args["thinking_mode"] == json!("disabled")
+}
+
+/// The request shapes that turn thinking off, and the shape of their twin:
+/// the same request with no thinking flag.
+const THINKING_OFF_TWINS: [(&str, &str); 3] = [
+    ("thinking_off", "plain"),
+    ("thinking_mode_disabled", "plain"),
+    ("thinking_off_force_nonempty", "force_nonempty"),
+];
+
+/// The record's twin: the record with the same input and parser version
+/// whose request has no thinking flag. dynamo recorded it with GPT-OSS
+/// reasoning on.
+fn reasoning_on_twin(record: &Value) -> Option<&'static Value> {
+    static RECORDS: OnceLock<HashMap<(String, String), Value>> = OnceLock::new();
+    let records = RECORDS.get_or_init(|| {
+        fixture()
+            .into_iter()
+            .filter(|record| record["kind"] == "stream")
+            .map(|record| {
+                let key = (
+                    record["name"].as_str().unwrap().to_owned(),
+                    record["version"].to_string(),
+                );
+                (key, record)
+            })
+            .collect()
+    });
+    let mut parts: Vec<&str> = record["name"].as_str()?.split('/').collect();
+    let at = parts
+        .iter()
+        .position(|part| THINKING_OFF_TWINS.iter().any(|(off, _)| off == part))?;
+    let (_, on) = THINKING_OFF_TWINS
+        .iter()
+        .find(|(off, _)| *off == parts[at])?;
+    parts[at] = on;
+    records.get(&(parts.join("/"), record["version"].to_string()))
+}
+
+/// The reasoning and answer text of an output.
+fn text_and_rest(output: &Value) -> (String, String) {
+    let (mut reasoning, mut content) = (String::new(), String::new());
+    for item in output.as_array().unwrap() {
+        for choice in item["data"]["choices"].as_array().into_iter().flatten() {
+            let delta = &choice["delta"];
+            reasoning.push_str(delta["reasoning_content"].as_str().unwrap_or_default());
+            content.push_str(delta["content"].as_str().unwrap_or_default());
+        }
+    }
+    (reasoning, content)
+}
+
+/// A GPT-OSS `stream` record, whose request turns thinking off, whose output
+/// is exactly what dynamo recorded for its twin: the same input with no
+/// thinking flag, and so with reasoning on. dynamo `37f2f0a712` does not let
+/// the flag turn GPT-OSS reasoning off (`preprocessor.rs:7161`); the recording
+/// is from `45e30e07`, which did.
+fn gpt_oss_reasoning_kept(record: &Value, output: &Value) -> bool {
+    is_gpt_oss(record)
+        && turns_thinking_off(record)
+        && reasoning_on_twin(record).is_some_and(|twin| output == &twin["output"])
+}
+
 #[tokio::test]
 async fn moved_stream_policies_match_dynamo_llm() {
     let mut checked = HashMap::<&str, usize>::new();
+    // The GPT-OSS records dynamo changed since the recording, by kind.
+    let mut kept = HashMap::<&str, usize>::new();
     let mut skipped = 0usize;
     let mut failures = Vec::new();
     let fixture = fixture();
@@ -696,7 +805,9 @@ async fn moved_stream_policies_match_dynamo_llm() {
         match record["kind"].as_str() {
             Some("predicates") => {
                 let mismatches = check_predicates(record);
-                if !mismatches.is_empty() {
+                if gpt_oss_rule_kept(record, &mismatches) {
+                    *kept.entry("predicates").or_default() += 1;
+                } else if !mismatches.is_empty() {
                     failures.push(format!("{name}: {}", mismatches.join("; ")));
                 }
                 *checked.entry("predicates").or_default() += 1;
@@ -709,6 +820,16 @@ async fn moved_stream_policies_match_dynamo_llm() {
                     continue;
                 }
                 match run_stream(record).await {
+                    Ok((output, with_roles))
+                        if output != record["output"]
+                            && gpt_oss_reasoning_kept(record, &output)
+                            && reasoning_on_twin(record).is_some_and(|twin| {
+                                twin.get("output_with_roles")
+                                    .is_none_or(|want| &with_roles == want)
+                            }) =>
+                    {
+                        *kept.entry("stream").or_default() += 1;
+                    }
                     Ok((output, with_roles)) => {
                         if output != record["output"] {
                             failures.push(format!(
@@ -737,7 +858,9 @@ async fn moved_stream_policies_match_dynamo_llm() {
             other => panic!("unknown record kind {other:?}"),
         }
     }
-    eprintln!("checked {checked:?}, skipped {skipped} refused requests");
+    eprintln!(
+        "checked {checked:?}, skipped {skipped} refused requests, kept GPT-OSS reasoning {kept:?}"
+    );
     assert!(checked["stream with jail"] > 0);
     assert!(
         failures.is_empty(),
@@ -750,6 +873,11 @@ async fn moved_stream_policies_match_dynamo_llm() {
             .cloned()
             .collect::<Vec<_>>()
             .join("\n")
+    );
+    assert_eq!(
+        kept,
+        HashMap::from([("predicates", 12), ("stream", 53)]),
+        "the GPT-OSS records dynamo changed since 45e30e07"
     );
 }
 
@@ -832,3 +960,6 @@ async fn recorded_jail_rejects_changed_guided_streaming() {
         }
     }
 }
+
+#[path = "support/review_gpt_oss_pins.rs"]
+mod review_gpt_oss_pins;
