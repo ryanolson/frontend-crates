@@ -996,7 +996,7 @@ fn coalesce(deltas: Vec<UnifiedParserEvent>) -> Vec<UnifiedParserEvent> {
 fn coalesce_deltas(deltas: Deltas) -> Deltas {
     let mut out = Deltas {
         events: Vec::with_capacity(deltas.events.len()),
-        spans: deltas.spans.as_ref().map(|_| InlineList::new()),
+        spans: deltas.spans.as_ref().map(|_| Vec::new()),
     };
     let mut spans = deltas.spans.map(IntoIterator::into_iter);
     for delta in deltas.events {
@@ -1418,14 +1418,14 @@ fn test_parser_override(_family: &str, _tools: &[Tool]) -> Option<Box<dyn Unifie
 #[derive(Default)]
 struct Deltas {
     events: Vec<UnifiedParserEvent>,
-    spans: Option<InlineList<Spans>>,
+    spans: Option<Vec<Spans>>,
 }
 
 impl Deltas {
     fn new(recording: bool) -> Self {
         Self {
             events: Vec::new(),
-            spans: recording.then(InlineList::new),
+            spans: recording.then(Vec::new),
         }
     }
 
