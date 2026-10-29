@@ -90,16 +90,18 @@ pub fn match_choice_sources(
         };
         for at in paired {
             let entry = group.pop_front().expect("one entry per paired choice");
-            let len =
-                |ranges: &[Range<usize>]| ranges.iter().map(|range| range.len()).sum::<usize>();
-            if len(&entry.content) == choices[at].content_len
-                && len(&entry.reasoning) == choices[at].reasoning_len
-            {
+            if entry_covers(&entry, &choices[at]) {
                 out[at] = Some(entry);
             }
         }
     }
     out
+}
+
+/// Whether `entry`'s ranges cover `choice`'s text lengths exactly.
+pub(crate) fn entry_covers(entry: &ChoiceSources, choice: &ChoiceText) -> bool {
+    let len = |ranges: &[Range<usize>]| ranges.iter().map(|range| range.len()).sum::<usize>();
+    len(&entry.content) == choice.content_len && len(&entry.reasoning) == choice.reasoning_len
 }
 
 /// Which field of a reasoning parser's result a run of text went to.
@@ -207,6 +209,24 @@ impl Spans {
             Repr::Off | Repr::Empty => Vec::new(),
             Repr::One(range) => vec![range],
             Repr::Many(ranges) => ranges,
+        }
+    }
+
+    /// [`into_ranges`](Self::into_ranges), writing one range into a vector
+    /// from `spares` that has room, such as an input entry's list, so a stage
+    /// that takes in one list per string and puts out one allocates none.
+    pub(crate) fn into_ranges_from(self, spares: &mut [Vec<Range<usize>>]) -> Vec<Range<usize>> {
+        match self.0 {
+            Repr::One(range) => match spares.iter_mut().find(|spare| spare.capacity() > 0) {
+                Some(spare) => {
+                    let mut out = std::mem::take(spare);
+                    out.clear();
+                    out.push(range);
+                    out
+                }
+                None => vec![range],
+            },
+            repr => Spans(repr).into_ranges(),
         }
     }
 

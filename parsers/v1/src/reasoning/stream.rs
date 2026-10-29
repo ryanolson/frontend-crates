@@ -19,9 +19,9 @@ use std::pin::Pin;
 use dynamo_protocols::types::ChatCompletionMessageContent;
 use futures::{Stream, StreamExt, stream};
 
-use crate::chat_stream::{ChatStreamItem, choice_texts};
+use crate::chat_stream::{ChatStreamItem, into_entries, match_chunk_sources};
 use crate::reasoning::{ParserResult, ReasoningParser, ReasoningParserType};
-use crate::sources::{ChoiceSources, SourceChannel, SourceRun, Spans, match_choice_sources};
+use crate::sources::{ChoiceSources, SourceChannel, SourceRun, Spans};
 
 /// Options for [`parse_reasoning_content_from_stream`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -501,8 +501,7 @@ where
                 // While recording, the input slot gives each choice's ranges and
                 // the output slot gets the ranges of the text this stage emits.
                 let mut matched = match_input_sources(&mut response);
-                let mut output_sources = matched.as_ref().map(|_| Vec::new());
-                let recording = output_sources.is_some();
+                let recording = matched.is_some();
                 if let Some(data) = response.chunk_mut() {
                     for (position, choice) in data.choices.iter_mut().enumerate() {
                         let given = matched
@@ -551,6 +550,11 @@ where
                             Some(given) => (spans_of(&given.content), spans_of(&given.reasoning)),
                             None => (Spans::recording(recording), Spans::recording(recording)),
                         };
+                        let has_given = given.is_some();
+                        // The input entry's lists, for this choice's output entry.
+                        let mut spares = given.map_or_else(Default::default, |given| {
+                            [given.content, given.reasoning]
+                        });
 
                         // Decide once per choice, from ITS OWN first
                         // non-whitespace content, whether the backend
@@ -592,9 +596,10 @@ where
                         {
                             if let Some(sources) = choice_state.sources.as_mut()
                                 && !choice_state.unsourced
-                                && let Some(given) = &given
+                                && has_given
                             {
-                                let fed = spans_of(&given.content);
+                                // The input entry's content list, kept in `spares`.
+                                let fed = spans_of(&spares[0]);
                                 debug_assert_eq!(
                                     fed.len(),
                                     text.len(),
@@ -764,22 +769,24 @@ where
                             }
                         }
 
-                        if let Some(output) = output_sources.as_mut()
+                        // Back at its position, so the output list reuses the
+                        // input's, in choice order.
+                        if let Some(matched) = matched.as_mut()
                             && !choice_state.unsourced
                             && known
                         {
-                            output.push(ChoiceSources {
+                            matched[position] = Some(ChoiceSources {
                                 index: choice.index,
-                                content: content_spans.into_ranges(),
-                                reasoning: reasoning_spans.into_ranges(),
+                                content: content_spans.into_ranges_from(&mut spares),
+                                reasoning: reasoning_spans.into_ranges_from(&mut spares),
                             });
                         }
                     }
                 }
-                if let Some(output) = output_sources
+                if let Some(matched) = matched
                     && let Some(slot) = response.sources_mut()
                 {
-                    *slot = output;
+                    *slot = into_entries(matched);
                 }
                 response
             };
@@ -912,14 +919,12 @@ where
 }
 
 /// While the item records, takes its input entries out of its slot and pairs
-/// them with its choices; see [`match_choice_sources`]. `None` when the item has
+/// them with its choices; see [`match_chunk_sources`]. `None` when the item has
 /// no slot.
 fn match_input_sources<T: ChatStreamItem>(response: &mut T) -> Option<Vec<Option<ChoiceSources>>> {
     let entries = std::mem::take(response.sources_mut()?);
-    let texts = response
-        .chunk()
-        .map_or_else(Vec::new, |data| choice_texts(&data.choices));
-    Some(match_choice_sources(entries, &texts))
+    let choices = response.chunk().map_or(&[][..], |data| &data.choices[..]);
+    Some(match_chunk_sources(entries, choices))
 }
 
 /// [`Spans`] of the caller's ranges.
