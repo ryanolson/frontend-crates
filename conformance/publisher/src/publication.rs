@@ -719,7 +719,7 @@ fn publication_time() -> Result<String> {
         !unsafe { libc::localtime_r(&now, local.as_mut_ptr()) }.is_null(),
         "cannot format publication time"
     );
-    let mut buffer = [0i8; 64];
+    let mut buffer = [0 as libc::c_char; 64];
     let format = c"%Y-%m-%d %H:%M %Z";
     let length = unsafe {
         libc::strftime(
