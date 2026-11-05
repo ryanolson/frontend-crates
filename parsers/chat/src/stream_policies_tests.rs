@@ -1348,3 +1348,26 @@ fn gpt_oss_starts_in_the_answer_only_after_a_header_that_is_not_an_assistants() 
         }
     }
 }
+
+/// A continued user message whose own text quotes an assistant header: with
+/// the boundary where that text starts, the header search stops there, so
+/// the reply is the answer, as dynamo reads it. Without the boundary, the
+/// quoted header would start the parser in reasoning.
+#[test]
+fn gpt_oss_looks_for_the_last_header_only_before_the_continued_text() {
+    let head = "<|start|>user<|message|>";
+    let prompt =
+        format!("{head}Explain this: <|start|>assistant<|channel|>analysis<|message|>quoted");
+    let at = |end| {
+        crate::prefill::prompt_reasoning_prefill_at_boundary(
+            Some("harmony"),
+            Some("gpt_oss"),
+            Some(&prompt),
+            end,
+        )
+    };
+    let bounded = at(Some(head.len()));
+    assert!(bounded.response() && !bounded.unified());
+    let unbounded = at(None);
+    assert!(!unbounded.response() && unbounded.unified());
+}
