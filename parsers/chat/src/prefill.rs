@@ -157,20 +157,6 @@ pub fn prompt_reasoning_prefill_for_parsers(
     reasoning_parser: Option<&str>,
     formatted_prompt: Option<&str>,
 ) -> PromptReasoningPrefill {
-    prompt_reasoning_prefill_at_boundary(tool_call_parser, reasoning_parser, formatted_prompt, None)
-}
-
-/// [`prompt_reasoning_prefill_for_parsers`], with the byte where a continued
-/// final message's own text starts in `formatted_prompt`, if the caller
-/// knows it. GPT-OSS looks for the prompt's last header only before it, as
-/// dynamo does (`header_search_end`), so a header that the message's text
-/// quotes does not choose where the parser starts.
-pub fn prompt_reasoning_prefill_at_boundary(
-    tool_call_parser: Option<&str>,
-    reasoning_parser: Option<&str>,
-    formatted_prompt: Option<&str>,
-    header_search_end: Option<usize>,
-) -> PromptReasoningPrefill {
     let unified = prompt_injected_reasoning_start_for_parsers(
         tool_call_parser,
         reasoning_parser,
@@ -199,14 +185,7 @@ pub fn prompt_reasoning_prefill_at_boundary(
     // message in the answer. After a header that is not an assistant's, the
     // reply is the answer too, as dynamo starts it.
     let end = (configured_family(tool_call_parser, reasoning_parser) == Some("gpt_oss"))
-        .then(|| {
-            formatted_prompt.and_then(|prompt| {
-                let end = header_search_end
-                    .filter(|end| prompt.is_char_boundary(*end))
-                    .unwrap_or(prompt.len());
-                gpt_oss_prompt_end(&prompt[..end])
-            })
-        })
+        .then(|| formatted_prompt.and_then(gpt_oss_prompt_end))
         .flatten();
     let open_analysis = end == Some(GptOssPromptEnd::Open(GPT_OSS_MESSAGE_HEADERS[1]));
     PromptReasoningPrefill {
