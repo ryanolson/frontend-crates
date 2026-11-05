@@ -1278,3 +1278,73 @@ async fn gpt_oss_opens_its_own_channel_after_a_generation_prompt() {
         );
     }
 }
+
+/// After a last header that is not an assistant's, the model writes no
+/// header of its own, so its reply is the answer: a continued user message,
+/// and a prompt with no generation prompt after a user message, as dynamo
+/// `d554c60a` reads them (`" two?"` and `" Four."`).
+#[tokio::test]
+async fn gpt_oss_answers_after_a_last_header_that_is_not_an_assistants() {
+    for (prompt, reply) in [
+        (
+            "<|start|>user<|message|>What is two plus".to_owned(),
+            " two?",
+        ),
+        (GPT_OSS_USER_TURN.to_owned(), " Four."),
+    ] {
+        assert_eq!(
+            gpt_oss_reply_after(&prompt, reply).await,
+            (reply.to_owned(), String::new()),
+            "{prompt}"
+        );
+    }
+}
+
+/// dynamo's role and metadata matrix (`gpt_oss_prefill_only_restores_assistant_messages`
+/// at `d554c60a`): a last header whose role is not exactly `assistant` starts
+/// the parser in the answer. An assistant header starts it in the answer only
+/// for an open final message, and in reasoning only for an open analysis
+/// message. dynamo replays the other assistant headers to its parser; our
+/// prefill cannot hold such a header.
+#[test]
+fn gpt_oss_starts_in_the_answer_only_after_a_header_that_is_not_an_assistants() {
+    for role in [
+        "assistant",
+        "user",
+        "system",
+        "developer",
+        "tool",
+        "assistant_extra",
+        "assistantx",
+    ] {
+        for metadata in [
+            "",
+            " to=python",
+            "<|channel|>analysis",
+            "<|channel|>final",
+            "<|constrain|>json",
+            " to=python<|channel|>analysis",
+            "<|channel|>analysis to=python",
+        ] {
+            let prompt = format!(
+                "<|start|>assistant<|channel|>analysis<|message|>earlier<|end|><|start|>{role}{metadata}<|message|>Hello"
+            );
+            let prefill = crate::prefill::prompt_reasoning_prefill_for_parsers(
+                Some("harmony"),
+                Some("gpt_oss"),
+                Some(&prompt),
+            );
+            let assistant = role == "assistant";
+            assert_eq!(
+                prefill.response(),
+                !assistant || metadata == "<|channel|>final",
+                "role={role} metadata={metadata}"
+            );
+            assert_eq!(
+                prefill.unified(),
+                assistant && metadata == "<|channel|>analysis",
+                "role={role} metadata={metadata}"
+            );
+        }
+    }
+}

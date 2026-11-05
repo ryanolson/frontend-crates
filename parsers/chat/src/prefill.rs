@@ -60,7 +60,8 @@ impl PromptReasoningPrefill {
 
     /// Whether the unified v2 parser starts inside the answer: the prompt
     /// ended inside a GPT-OSS `final` or `commentary` message, as a prompt that
-    /// continues its final message (`continue_final_message`) does.
+    /// continues its final message (`continue_final_message`) does, or after a
+    /// last header that is not an assistant's.
     pub fn response(self) -> bool {
         self.response
     }
@@ -73,13 +74,37 @@ const GPT_OSS_MESSAGE_HEADERS: [&str; 3] = [
     "<|channel|>commentary<|message|>",
 ];
 
-/// The header of the assistant message that `prompt` ends inside, if it ends
-/// inside one: the last `<|start|>assistant` opens one of
-/// [`GPT_OSS_MESSAGE_HEADERS`], and nothing after it ends the message. A
-/// generation prompt ends at `<|start|>assistant`, with no header, so it
-/// opens none.
-fn gpt_oss_open_message(prompt: &str) -> Option<&'static str> {
-    let (_, message) = prompt.rsplit_once("<|start|>assistant")?;
+/// Where a GPT-OSS prompt ends, for the unified parser's start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GptOssPromptEnd {
+    /// Inside the assistant message with this header: the model continues it.
+    Open(&'static str),
+    /// After a last header that is not an assistant's, as a continued user
+    /// message, or a prompt with no generation prompt, ends. The model
+    /// writes no header of its own there, so its reply is the answer.
+    NotAssistant,
+}
+
+/// Where `prompt` ends ([`GptOssPromptEnd`]), read from its last
+/// `<|start|>` header as dynamo reads it: the role is the text after
+/// `<|start|>`, up to whitespace or `<`. A generation prompt ends at
+/// `<|start|>assistant`, with no channel open, so it gives `None`, as does an
+/// assistant message that ended or a header the list does not hold.
+fn gpt_oss_prompt_end(prompt: &str) -> Option<GptOssPromptEnd> {
+    let (_, header) = prompt.rsplit_once("<|start|>")?;
+    let role_end = header
+        .find(|c: char| c.is_whitespace() || c == '<')
+        .unwrap_or(header.len());
+    if &header[..role_end] != "assistant" {
+        return Some(GptOssPromptEnd::NotAssistant);
+    }
+    gpt_oss_open_message(&header[role_end..]).map(GptOssPromptEnd::Open)
+}
+
+/// The header of the assistant message that `message` (the text after
+/// `<|start|>assistant`) opens, if the message is still open: it starts with
+/// one of [`GPT_OSS_MESSAGE_HEADERS`], and nothing after the header ends it.
+fn gpt_oss_open_message(message: &str) -> Option<&'static str> {
     let header = GPT_OSS_MESSAGE_HEADERS
         .into_iter()
         .find(|header| message.starts_with(header))?;
@@ -157,15 +182,16 @@ pub fn prompt_reasoning_prefill_for_parsers(
     };
     // A continued GPT-OSS message leaves its channel open: an analysis
     // message starts the parser in reasoning, and a final or commentary
-    // message in the answer.
-    let open_message = (configured_family(tool_call_parser, reasoning_parser) == Some("gpt_oss"))
-        .then(|| formatted_prompt.and_then(gpt_oss_open_message))
+    // message in the answer. After a header that is not an assistant's, the
+    // reply is the answer too, as dynamo starts it.
+    let end = (configured_family(tool_call_parser, reasoning_parser) == Some("gpt_oss"))
+        .then(|| formatted_prompt.and_then(gpt_oss_prompt_end))
         .flatten();
-    let open_analysis = open_message == Some(GPT_OSS_MESSAGE_HEADERS[1]);
+    let open_analysis = end == Some(GptOssPromptEnd::Open(GPT_OSS_MESSAGE_HEADERS[1]));
     PromptReasoningPrefill {
         legacy,
         unified: unified || prefix.is_some() || open_analysis,
         prefix,
-        response: open_message.is_some() && !open_analysis,
+        response: end.is_some() && !open_analysis,
     }
 }
