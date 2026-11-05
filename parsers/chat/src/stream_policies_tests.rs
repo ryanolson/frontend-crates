@@ -1163,3 +1163,118 @@ async fn gpt_oss_keeps_its_analysis_as_reasoning_with_thinking_off_in_the_stream
         assert_eq!(reasoning, "Private analysis.", "args {args:?}");
     }
 }
+
+/// The content and reasoning that the gpt-oss stream gives for `reply`,
+/// after a rendered prompt `prompt`.
+async fn gpt_oss_reply_after(prompt: &str, reply: &str) -> (String, String) {
+    let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "gpt-oss", "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .expect("request");
+    let view = ChatStreamRequest {
+        request: &request,
+        chat_template_args: None,
+        client_thinking_field: false,
+        explicit_guided_decoding: false,
+    };
+    let mut chunk = chat_stream_chunk(0, Some(Role::Assistant));
+    let choice = &mut chunk.data.as_mut().unwrap().inner.choices[0];
+    choice.delta.content = Some(ChatCompletionMessageContent::Text(reply.to_string()));
+    choice.finish_reason = Some(FinishReason::Stop);
+    let route = crate::route::tool_processing_route(
+        Some("harmony"),
+        Some("gpt_oss"),
+        &request,
+        crate::version::ParserVersion::Auto,
+    )
+    .expect("route");
+    let output: Vec<Item> = parse_chat_stream(
+        stream::iter([chunk]),
+        ChatStreamParsers {
+            tool_call_parser: Some("harmony"),
+            reasoning_parser: Some("gpt_oss"),
+        },
+        view,
+        ChatStreamPlan {
+            route,
+            guided_tool_constraint: GuidedToolConstraint::None,
+            prompt_reasoning: crate::prefill::prompt_reasoning_prefill_for_parsers(
+                Some("harmony"),
+                Some("gpt_oss"),
+                Some(prompt),
+            ),
+            tool_definitions: Vec::new(),
+            parser_version: crate::version::ParserVersion::Auto,
+            guided_tool_streaming_disabled: false,
+        },
+        |stream, _| stream,
+    )
+    .collect()
+    .await;
+    let (mut content, mut reasoning) = (String::new(), String::new());
+    for choice in output
+        .iter()
+        .filter_map(|item| item.data.as_ref())
+        .flat_map(|chunk| &chunk.inner.choices)
+    {
+        if let Some(ChatCompletionMessageContent::Text(text)) = &choice.delta.content {
+            content.push_str(text);
+        }
+        if let Some(text) = &choice.delta.reasoning_content {
+            reasoning.push_str(text);
+        }
+    }
+    (content, reasoning)
+}
+
+const GPT_OSS_USER_TURN: &str = "<|start|>user<|message|>What is two plus two?<|end|>";
+
+/// A prompt that continues the final message (`continue_final_message`)
+/// ends inside the final channel, so the model never sends that channel's
+/// header. The stream reads the reply as the answer, as dynamo
+/// `d554c60a` does by replaying the open header to the parser.
+#[tokio::test]
+async fn gpt_oss_continues_a_final_channel_the_prompt_left_open() {
+    let prompt =
+        format!("{GPT_OSS_USER_TURN}<|start|>assistant<|channel|>final<|message|>The answer is");
+    assert_eq!(
+        gpt_oss_reply_after(&prompt, " four.<|return|>").await,
+        (" four.".to_owned(), String::new())
+    );
+}
+
+/// The same for an analysis channel the prompt left open: the reply is
+/// reasoning until the model opens the final channel.
+#[tokio::test]
+async fn gpt_oss_continues_an_analysis_channel_the_prompt_left_open() {
+    let prompt = format!("{GPT_OSS_USER_TURN}<|start|>assistant<|channel|>analysis<|message|>Let");
+    assert_eq!(
+        gpt_oss_reply_after(
+            &prompt,
+            " me add.<|end|><|start|>assistant<|channel|>final<|message|>4<|return|>"
+        )
+        .await,
+        ("4".to_owned(), " me add.".to_owned())
+    );
+}
+
+/// A prompt that ends at the assistant header opens no channel, and a
+/// prompt whose last assistant message ended opens none either: the model
+/// sends its own headers, as before.
+#[tokio::test]
+async fn gpt_oss_opens_its_own_channel_after_a_generation_prompt() {
+    let reply = "<|channel|>final<|message|>4<|return|>";
+    for prompt in [
+        format!("{GPT_OSS_USER_TURN}<|start|>assistant"),
+        format!(
+            "{GPT_OSS_USER_TURN}<|start|>assistant<|channel|>final<|message|>4<|end|>\
+             <|start|>user<|message|>Again.<|end|><|start|>assistant"
+        ),
+    ] {
+        assert_eq!(
+            gpt_oss_reply_after(&prompt, reply).await,
+            ("4".to_owned(), String::new()),
+            "{prompt}"
+        );
+    }
+}

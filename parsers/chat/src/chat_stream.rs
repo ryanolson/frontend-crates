@@ -29,6 +29,7 @@ use dynamo_parsers::reasoning::stream::{
     supports_reasoning_before_guided_json,
 };
 use dynamo_parsers::tool_calling::ToolDefinition;
+use dynamo_parsers_v2::UnifiedParserStartingState;
 use dynamo_protocols::types::ChatCompletionToolChoiceOption;
 use dynamo_renderer::request_rules::{has_structured_response_format, is_minimax_m3_family};
 use futures::Stream;
@@ -194,7 +195,14 @@ where
             tool_definitions,
             guided_tool_constraint,
             StreamPrefill {
-                starting_state: stream_prefill(family, prompt_injected_reasoning),
+                // A prompt that ends inside the answer channel, as a continued
+                // final message does, starts the parser there: the model never
+                // sends that channel's header.
+                starting_state: if prompt_prefill.response() {
+                    UnifiedParserStartingState::Response
+                } else {
+                    stream_prefill(family, prompt_injected_reasoning)
+                },
                 prefix: prompt_prefill.prefix(),
             },
             family,

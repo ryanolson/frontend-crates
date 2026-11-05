@@ -19,6 +19,7 @@ pub struct PromptReasoningPrefill {
     legacy: bool,
     unified: bool,
     prefix: Option<&'static str>,
+    response: bool,
 }
 
 impl From<bool> for PromptReasoningPrefill {
@@ -28,6 +29,7 @@ impl From<bool> for PromptReasoningPrefill {
             legacy: value,
             unified: value,
             prefix: None,
+            response: false,
         }
     }
 }
@@ -55,6 +57,37 @@ impl PromptReasoningPrefill {
     pub fn prefix(self) -> Option<&'static str> {
         self.prefix
     }
+
+    /// Whether the unified v2 parser starts inside the answer: the prompt
+    /// ended inside a GPT-OSS `final` or `commentary` message, as a prompt that
+    /// continues its final message (`continue_final_message`) does.
+    pub fn response(self) -> bool {
+        self.response
+    }
+}
+
+/// The Harmony message headers a continued GPT-OSS message can open with.
+const GPT_OSS_MESSAGE_HEADERS: [&str; 3] = [
+    "<|channel|>final<|message|>",
+    "<|channel|>analysis<|message|>",
+    "<|channel|>commentary<|message|>",
+];
+
+/// The header of the assistant message that `prompt` ends inside, if it ends
+/// inside one: the last `<|start|>assistant` opens one of
+/// [`GPT_OSS_MESSAGE_HEADERS`], and nothing after it ends the message. A
+/// generation prompt ends at `<|start|>assistant`, with no header, so it
+/// opens none.
+fn gpt_oss_open_message(prompt: &str) -> Option<&'static str> {
+    let (_, message) = prompt.rsplit_once("<|start|>assistant")?;
+    let header = GPT_OSS_MESSAGE_HEADERS
+        .into_iter()
+        .find(|header| message.starts_with(header))?;
+    let body = &message[header.len()..];
+    let ended = ["<|end|>", "<|return|>", "<|call|>", "<|start|>"]
+        .iter()
+        .any(|marker| body.contains(marker));
+    (!ended).then_some(header)
 }
 
 /// Whether `formatted_prompt`, with trailing whitespace removed, ends in the reasoning
@@ -122,9 +155,17 @@ pub fn prompt_reasoning_prefill_for_parsers(
     } else {
         None
     };
+    // A continued GPT-OSS message leaves its channel open: an analysis
+    // message starts the parser in reasoning, and a final or commentary
+    // message in the answer.
+    let open_message = (configured_family(tool_call_parser, reasoning_parser) == Some("gpt_oss"))
+        .then(|| formatted_prompt.and_then(gpt_oss_open_message))
+        .flatten();
+    let open_analysis = open_message == Some(GPT_OSS_MESSAGE_HEADERS[1]);
     PromptReasoningPrefill {
         legacy,
-        unified: unified || prefix.is_some(),
+        unified: unified || prefix.is_some() || open_analysis,
         prefix,
+        response: open_message.is_some() && !open_analysis,
     }
 }
