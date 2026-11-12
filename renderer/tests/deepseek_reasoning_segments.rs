@@ -69,3 +69,50 @@ fn v41_rejects_literal_image_placeholders_in_reasoning_segments() {
     let error = DeepSeekV41Formatter.render(&segmented).unwrap_err();
     assert!(error.to_string().contains("literal image placeholders"));
 }
+
+#[test]
+#[ignore = "F1: V4.1 counts tool-only results as a new user turn and drops the current reasoning"]
+fn v41_keeps_current_reasoning_segments_after_tool_results() {
+    let mut body = json!({
+        "model": "deepseek",
+        "tools": [{"type": "function", "function": {
+            "name": "weather", "parameters": {"type": "object", "properties": {}}
+        }}],
+        "messages": [
+            {"role": "user", "content": "Look up the weather."},
+            {
+                "role": "assistant", "content": null,
+                "reasoning_content": ["First reason.", "", "Second reason.", ""],
+                "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "weather", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "Sunny"}
+        ]
+    });
+    let reasoning = "<think>First reason.\nSecond reason.</think>";
+    let control: CreateChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+    assert!(
+        DeepSeekV41Formatter
+            .render(&control)
+            .unwrap()
+            .contains(reasoning)
+    );
+
+    let mut wrong = Vec::new();
+    for case in ["tool_choice_none", "omitted_tools"] {
+        if case == "tool_choice_none" {
+            body["tool_choice"] = json!("none");
+        } else {
+            body.as_object_mut().unwrap().remove("tools");
+            body.as_object_mut().unwrap().remove("tool_choice");
+        }
+        let request: CreateChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+        let prompt = DeepSeekV41Formatter.render(&request).unwrap();
+        if !prompt.contains(reasoning) {
+            wrong.push(format!("{case}: expected {reasoning:?} in {prompt:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
